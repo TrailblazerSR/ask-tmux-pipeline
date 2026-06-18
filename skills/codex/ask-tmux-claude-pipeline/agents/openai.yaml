@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ask Tmux Claude Pipeline"
+  short_description: "Pipeline prompts through tmux Claude"
+  default_prompt: "Use $ask-tmux-claude-pipeline to send this prompt through tmux Claude and synthesize the result."

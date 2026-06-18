@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+runner="$script_dir/ask-tmux-consultant"
+if [[ ! -x "$runner" ]]; then
+  runner="$(command -v ask-tmux-consultant 2>/dev/null || printf '/home/h3031/bin/ask-tmux-consultant')"
+fi
+
+cmd="${1:-}"
+if [[ -z "$cmd" ]]; then
+  exec "$runner" --help
+fi
+shift
+exec "$runner" "$cmd" --provider codex "$@"

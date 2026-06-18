@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ask Tmux Codex"
+  short_description: "Ask Codex through a reusable tmux consultant reviewer session"
+  default_prompt: "Use ask-tmux-codex for ask-Codex, Codex review/comment/suggest, external Codex reviewer, consultant Codex session, ask Codex in tmux, and repeated Codex consultation requests."

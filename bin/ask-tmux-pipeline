@@ -1,0 +1,1026 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.1.0"
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+
+default_base_runner() {
+  if [[ -x "$SCRIPT_DIR/ask-tmux-consultant" ]]; then
+    printf '%s\n' "$SCRIPT_DIR/ask-tmux-consultant"
+  elif command -v ask-tmux-consultant >/dev/null 2>&1; then
+    command -v ask-tmux-consultant
+  else
+    printf '/home/h3031/bin/ask-tmux-consultant\n'
+  fi
+}
+
+BASE_RUNNER="${ASK_TMUX_CONSULTANT_RUNNER:-$(default_base_runner)}"
+PIPELINE_STATE_ROOT="${ASK_TMUX_PIPELINE_STATE_ROOT:-$HOME/.omx/state/tmux-pipelines}"
+
+usage() {
+  cat <<'USAGE'
+ask-tmux-pipeline <command> [options]
+
+Commands:
+  start          Start a tmux pipeline from an owner prompt
+  answer         Resume a waiting pipeline with the user's answer
+  review         Send an owner draft back to the same tmux consultant for review
+  status         Show pipeline state
+  resume         Print the next action for an existing pipeline
+  final-context  Build and print the merged final-context artifact
+  doctor         Check wrappers, base runner, and pipeline state paths
+
+Common options:
+  --provider claude|codex
+  --mode synthesize|mirror|pure|review     Default: synthesize; pure is mirror
+  --pipeline-id ID
+  --key KEY                              Consultant key override
+  --cwd PATH
+  --cwd-mode project|parent|git|current  Default: project
+  --prompt TEXT | --prompt-file PATH|-   Required for start
+  --materials PATH                       Repeatable extra material
+  --answer TEXT | --answer-file PATH|-   Required for answer
+  --draft TEXT | --draft-file PATH|-     Required for review
+  --stub                                 Use no-cost base-runner stub
+  --stub-status final|needs-input|blocked|malformed
+  --stub-question TEXT
+  --stub-recommended TEXT
+  --dry-run
+  --fresh --replace --release manual|now|ttl
+  --ready-timeout SECONDS --wait-timeout SECONDS
+  --auto-trust
+
+Exit codes:
+  0   Pipeline has final/ready output or status command succeeded
+  10  Pipeline is waiting for user input; this is an expected pause
+  20  Pipeline is blocked or consultant response failed protocol parsing
+  30  Underlying tmux consultant transport failed
+  2   Usage error
+USAGE
+}
+
+die() {
+  local code="$1"
+  shift
+  printf 'ERROR: %s\n' "$*" >&2
+  exit "$code"
+}
+
+warn() {
+  printf 'WARN: %s\n' "$*" >&2
+}
+
+info() {
+  printf '%s\n' "$*"
+}
+
+slugify() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-+/-/g' \
+    | cut -c1-72
+}
+
+short_hash() {
+  printf '%s' "$1" | sha1sum | awk '{print substr($1,1,8)}'
+}
+
+project_slug_from_path() {
+  local resolved="$1" base hash
+  base="$(slugify "$(basename "$resolved")")"
+  [[ -n "$base" ]] || base="root"
+  hash="$(short_hash "$resolved")"
+  printf '%s-%s\n' "$base" "$hash"
+}
+
+invoked_provider() {
+  case "$(basename "$0")" in
+    ask-tmux-claude-pipeline|ask-tmux-claude-pure|ask-tux-claude-pipeline) printf 'claude\n' ;;
+    ask-tmux-codex-pipeline|ask-tmux-codex-pure) printf 'codex\n' ;;
+    *) printf '\n' ;;
+  esac
+}
+
+invoked_mode() {
+  case "$(basename "$0")" in
+    ask-tmux-claude-pure|ask-tmux-codex-pure) printf 'mirror\n' ;;
+    *) printf '\n' ;;
+  esac
+}
+
+provider_wrapper() {
+  local name
+  case "$1" in
+    claude|codex)
+      name="ask-tmux-$1"
+      if [[ -x "$SCRIPT_DIR/$name" ]]; then
+        printf '%s\n' "$SCRIPT_DIR/$name"
+      elif command -v "$name" >/dev/null 2>&1; then
+        command -v "$name"
+      else
+        printf '/home/h3031/bin/%s\n' "$name"
+      fi
+      ;;
+    *) die 2 "unknown provider: $1" ;;
+  esac
+}
+
+find_project_root() {
+  local start="$1" dir
+  dir="$(realpath -m "$start")"
+  while true; do
+    for marker in AGENTS.md CLAUDE.md .git .bioagent pyproject.toml package.json; do
+      if [[ -e "$dir/$marker" ]]; then
+        printf '%s\n' "$dir"
+        return
+      fi
+    done
+    [[ "$dir" == "/" ]] && break
+    dir="$(dirname "$dir")"
+  done
+  realpath -m "$start"
+}
+
+first_material_base() {
+  local material
+  for material in "$@"; do
+    [[ "$material" == "-" ]] && continue
+    if [[ -d "$material" ]]; then
+      realpath -m "$material"
+      return
+    fi
+    if [[ -e "$material" ]]; then
+      dirname "$(realpath -m "$material")"
+      return
+    fi
+  done
+  pwd
+}
+
+resolve_cwd() {
+  local explicit_cwd="$1" mode="$2" base root parent git_root
+  shift 2
+  if [[ -n "$explicit_cwd" ]]; then
+    base="$(realpath -m "$explicit_cwd")"
+  else
+    base="$(first_material_base "$@")"
+  fi
+
+  case "$mode" in
+    current)
+      if [[ -n "$explicit_cwd" ]]; then
+        root="$base"
+      else
+        root="$(pwd)"
+      fi
+      ;;
+    git)
+      if git_root="$(git -C "$base" rev-parse --show-toplevel 2>/dev/null)"; then
+        root="$git_root"
+      else
+        root="$(find_project_root "$base")"
+      fi
+      ;;
+    parent|project)
+      root="$(find_project_root "$base")"
+      ;;
+    *)
+      die 2 "unknown --cwd-mode: $mode"
+      ;;
+  esac
+
+  if [[ "$mode" == "parent" ]]; then
+    parent="$(dirname "$root")"
+    [[ "$parent" == "$root" ]] || root="$parent"
+  fi
+  realpath -m "$root"
+}
+
+read_text_arg() {
+  local inline="$1" file="$2"
+  if [[ -n "$inline" ]]; then
+    printf '%s\n' "$inline"
+  elif [[ -n "$file" ]]; then
+    if [[ "$file" == "-" ]]; then
+      cat
+    else
+      [[ -f "$file" ]] || die 2 "file not found: $file"
+      sed -n '1,20000p' "$file"
+    fi
+  else
+    return 1
+  fi
+}
+
+read_json_field() {
+  local file="$1" field="$2"
+  [[ -f "$file" ]] || return 0
+  python3 - "$file" "$field" <<'PY'
+import json
+import sys
+
+path, field = sys.argv[1], sys.argv[2]
+try:
+    with open(path, "r", encoding="utf-8") as handle:
+        value = json.load(handle).get(field)
+except Exception:
+    value = None
+if isinstance(value, str):
+    sys.stdout.write(value)
+elif value is not None:
+    sys.stdout.write(str(value))
+PY
+}
+
+state_set() {
+  local file="$1"
+  shift
+  mkdir -p "$(dirname "$file")"
+  python3 - "$file" "$@" <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as handle:
+        state = json.load(handle)
+except Exception:
+    state = {}
+
+int_fields = {"question_seq", "response_count"}
+bool_fields = {"review_requested"}
+
+for raw in sys.argv[2:]:
+    key, sep, value = raw.partition("=")
+    if not sep:
+        continue
+    if value == "__DELETE__":
+        state.pop(key, None)
+    elif key in int_fields:
+        try:
+            state[key] = int(value)
+        except ValueError:
+            state[key] = 0
+    elif key in bool_fields:
+        state[key] = value.lower() == "true"
+    else:
+        state[key] = value
+
+now = datetime.now(timezone.utc).isoformat()
+state.setdefault("created_at", now)
+state["updated_at"] = now
+
+tmp = f"{path}.{os.getpid()}.tmp"
+with open(tmp, "w", encoding="utf-8") as handle:
+    json.dump(state, handle, indent=2, sort_keys=True)
+    handle.write("\n")
+os.replace(tmp, path)
+PY
+}
+
+copy_state_indexes() {
+  local state_file="$1" provider="$2" project_slug="$3" pipeline_id="$4"
+  local global_file current_file lock_file tmp
+  global_file="$PIPELINE_STATE_ROOT/$provider/$project_slug/$pipeline_id.json"
+  current_file="$PIPELINE_STATE_ROOT/current.json"
+  lock_file="$PIPELINE_STATE_ROOT/.lock"
+  mkdir -p "$(dirname "$global_file")" "$PIPELINE_STATE_ROOT"
+  exec 8>"$lock_file"
+  flock -w 5 8 || die 30 "pipeline state index is locked: $lock_file"
+  tmp="${global_file}.$$.$RANDOM.tmp"
+  cp "$state_file" "$tmp"
+  mv "$tmp" "$global_file"
+  state_set "$current_file" \
+    "schema=ask_tmux_pipeline.current.v1" \
+    "provider=$provider" \
+    "project_slug=$project_slug" \
+    "pipeline_id=$pipeline_id" \
+    "state_file=$state_file" \
+    "global_state_file=$global_file"
+  flock -u 8 || true
+}
+
+pipeline_paths() {
+  local cwd="$1" provider="$2" pipeline_id="$3"
+  PIPELINE_DIR="$cwd/.omx/tmux-pipelines/$pipeline_id"
+  PIPELINE_STATE_FILE="$PIPELINE_DIR/state.json"
+  PROJECT_SLUG="$(project_slug_from_path "$cwd")"
+  CONSULTANT_KEY="pipeline-$pipeline_id"
+}
+
+new_pipeline_id() {
+  local provider="$1" cwd="$2" prompt="$3"
+  local stamp hash
+  stamp="$(date +%Y%m%dT%H%M%S)"
+  hash="$(short_hash "$provider|$cwd|$prompt|$$|$RANDOM")"
+  printf 'pipe-%s-%s\n' "$stamp" "$hash"
+}
+
+normalize_mode() {
+  case "$1" in
+    synthesize|"") printf 'synthesize\n' ;;
+    mirror|pure) printf 'mirror\n' ;;
+    review) printf 'review\n' ;;
+    *) die 2 "unknown --mode: $1" ;;
+  esac
+}
+
+parse_response_assignments() {
+  local response_file="$1"
+  python3 - "$response_file" <<'PY'
+import shlex
+import sys
+
+path = sys.argv[1]
+values = {}
+error = ""
+
+try:
+    with open(path, "r", encoding="utf-8") as handle:
+        raw_lines = handle.read().splitlines()
+except Exception as exc:
+    raw_lines = []
+    error = f"cannot read response: {exc}"
+
+header = []
+if not error:
+    for line in raw_lines:
+        if not line.strip():
+            break
+        header.append(line)
+    if not header:
+        error = "missing pipeline status header"
+
+if not error:
+    def parse_exact(line_number, expected_key):
+        if line_number >= len(header):
+            return None, f"missing required header line: {expected_key}"
+        line = header[line_number]
+        if ":" not in line:
+            return None, f"malformed header line {line_number + 1}: {line}"
+        key, value = line.split(":", 1)
+        if key.strip() != expected_key:
+            return None, f"expected {expected_key} at header line {line_number + 1}, got {key.strip() or '<empty>'}"
+        return value.strip(), ""
+
+    status_value, error = parse_exact(0, "PIPELINE_STATUS")
+    if not error:
+        values["PIPELINE_STATUS"] = status_value
+        stage_value, error = parse_exact(1, "PIPELINE_STAGE")
+    if not error:
+        values["PIPELINE_STAGE"] = stage_value
+
+status = values.get("PIPELINE_STATUS", "")
+if not error and status not in {"FINAL", "NEEDS_INPUT", "BLOCKED"}:
+    error = f"invalid or missing PIPELINE_STATUS: {status or '<empty>'}"
+if not error and status == "NEEDS_INPUT":
+    question_id, error = parse_exact(2, "QUESTION_ID")
+    if not error:
+        values["QUESTION_ID"] = question_id
+        question, error = parse_exact(3, "QUESTION")
+    if not error:
+        values["QUESTION"] = question
+        if not question.strip():
+            error = "NEEDS_INPUT response must include QUESTION"
+    if not error and len(header) >= 5:
+        recommended, error = parse_exact(4, "RECOMMENDED_DEFAULT")
+        if not error:
+            values["RECOMMENDED_DEFAULT"] = recommended
+    if not error and len(header) > 5:
+        error = f"unexpected extra header line {len(header)}: {header[5]}"
+if not error and status in {"FINAL", "BLOCKED"} and len(header) > 2:
+    error = f"{status} response must not include extra header lines"
+
+if error:
+    out = {
+        "PARSED_STATUS": "PARSE_ERROR",
+        "PARSED_STAGE": values.get("PIPELINE_STAGE", ""),
+        "PARSED_CONSULTANT_QUESTION_ID": values.get("QUESTION_ID", ""),
+        "PARSED_QUESTION": values.get("QUESTION", ""),
+        "PARSED_RECOMMENDED": values.get("RECOMMENDED_DEFAULT", ""),
+        "PARSE_ERROR": error,
+    }
+else:
+    out = {
+        "PARSED_STATUS": status,
+        "PARSED_STAGE": values.get("PIPELINE_STAGE", ""),
+        "PARSED_CONSULTANT_QUESTION_ID": values.get("QUESTION_ID", ""),
+        "PARSED_QUESTION": values.get("QUESTION", ""),
+        "PARSED_RECOMMENDED": values.get("RECOMMENDED_DEFAULT", ""),
+        "PARSE_ERROR": "",
+    }
+
+for key, value in out.items():
+    print(f"{key}={shlex.quote(value)}")
+PY
+}
+
+write_structured_stub_response() {
+  local response_file="$1" status="$2" stage="$3" question="$4" recommended="$5"
+  case "$status" in
+    final|"")
+      {
+        printf 'PIPELINE_STATUS: FINAL\n'
+        printf 'PIPELINE_STAGE: %s\n\n' "$stage"
+        printf 'Stub pipeline final response for stage `%s`.\n' "$stage"
+      } > "$response_file"
+      ;;
+    needs-input)
+      {
+        printf 'PIPELINE_STATUS: NEEDS_INPUT\n'
+        printf 'PIPELINE_STAGE: %s\n' "$stage"
+        printf 'QUESTION_ID: consultant-q001\n'
+        printf 'QUESTION: %s\n' "${question:-What constraint should I apply before finalizing?}"
+        printf 'RECOMMENDED_DEFAULT: %s\n\n' "${recommended:-Proceed with the conservative default.}"
+        printf 'Stub pipeline clarification request.\n'
+      } > "$response_file"
+      ;;
+    blocked)
+      {
+        printf 'PIPELINE_STATUS: BLOCKED\n'
+        printf 'PIPELINE_STAGE: %s\n\n' "$stage"
+        printf 'Stub pipeline blocked response.\n'
+      } > "$response_file"
+      ;;
+    malformed)
+      {
+        printf 'This response intentionally lacks the required pipeline header.\n'
+      } > "$response_file"
+      ;;
+    *)
+      die 2 "unknown --stub-status: $status"
+      ;;
+  esac
+}
+
+consultant_prompt() {
+  local mode="$1" stage="$2"
+  cat <<EOF
+Follow the tmux pipeline protocol for the owner prompt.
+Mode: $mode
+Stage: $stage
+
+Begin your response file with exactly this top-of-file header block, followed by one blank line:
+PIPELINE_STATUS: FINAL | NEEDS_INPUT | BLOCKED
+PIPELINE_STAGE: $stage
+QUESTION_ID: <only when NEEDS_INPUT>
+QUESTION: <one focused user question, only when NEEDS_INPUT>
+RECOMMENDED_DEFAULT: <recommended answer, only when useful>
+
+Rules:
+- Ask at most one user question.
+- Use NEEDS_INPUT only when the answer materially changes the final work.
+- Use FINAL when your work is ready for the owner CLI to synthesize.
+- Use BLOCKED only when no safe assumption or continuation is possible.
+- Each header field must be exactly one physical line; leave exactly one blank line after the header block.
+- Stay read-only except for writing the required response file.
+EOF
+}
+
+run_consultant() {
+  local provider="$1" mode="$2" stage="$3" cwd="$4" key="$5" release_policy="$6" stub="$7" stub_status="$8" stub_question="$9" stub_recommended="${10}" ready_timeout="${11}" wait_timeout="${12}" auto_trust="${13}" fresh="${14}" replace="${15}"
+  shift 15
+  local materials=("$@")
+  local wrapper output_file response_file consultant_state output prompt
+  wrapper="$(provider_wrapper "$provider")"
+  prompt="$(consultant_prompt "$mode" "$stage")"
+  output_file="$PIPELINE_DIR/consultant-${stage}-$(date +%Y%m%dT%H%M%S)-$$.out"
+
+  local cmd=("$wrapper" send --key "$key" --cwd "$cwd" --cwd-mode current --task custom --prompt "$prompt" --wait --release "$release_policy" --ready-timeout "$ready_timeout" --wait-timeout "$wait_timeout")
+  [[ "$stub" == "true" ]] && cmd+=(--stub)
+  [[ "$auto_trust" == "true" ]] && cmd+=(--auto-trust)
+  [[ "$fresh" == "true" ]] && cmd+=(--fresh)
+  [[ "$replace" == "true" ]] && cmd+=(--replace)
+  local material
+  for material in "${materials[@]+"${materials[@]}"}"; do
+    cmd+=(--materials "$material")
+  done
+
+  state_set "$PIPELINE_STATE_FILE" "status=waiting_for_consultant" "last_stage=$stage"
+  if ! output="$("${cmd[@]}" 2>&1)"; then
+    printf '%s\n' "$output" > "$output_file"
+    state_set "$PIPELINE_STATE_FILE" "status=blocked" "blocked_reason=consultant transport failed" "last_consultant_output=$output_file"
+    copy_state_indexes "$PIPELINE_STATE_FILE" "$provider" "$PROJECT_SLUG" "$(read_json_field "$PIPELINE_STATE_FILE" pipeline_id)"
+    printf '%s\n' "$output"
+    die 30 "tmux consultant transport failed; output=$output_file"
+  fi
+  printf '%s\n' "$output" > "$output_file"
+
+  response_file="$(printf '%s\n' "$output" | sed -n 's/^response_file=//p' | tail -1)"
+  consultant_state="$(printf '%s\n' "$output" | sed -n 's/^state=//p' | tail -1)"
+  [[ -n "$response_file" && -f "$response_file" ]] || die 30 "base runner did not return a response file; output=$output_file"
+  if [[ "$stub" == "true" ]]; then
+    write_structured_stub_response "$response_file" "$stub_status" "$stage" "$stub_question" "$stub_recommended"
+  fi
+  state_set "$PIPELINE_STATE_FILE" \
+    "latest_response_file=$response_file" \
+    "last_consultant_output=$output_file" \
+    "consultant_state_file=$consultant_state"
+  printf '%s\n' "$response_file"
+}
+
+artifact_for_stage() {
+  local stage="$1" seq="$2"
+  case "$stage" in
+    initial) printf '%s/tmux-initial.md\n' "$PIPELINE_DIR" ;;
+    followup) printf '%s/tmux-followup-%03d.md\n' "$PIPELINE_DIR" "$seq" ;;
+    review) printf '%s/tmux-review.md\n' "$PIPELINE_DIR" ;;
+    *) printf '%s/tmux-%s.md\n' "$PIPELINE_DIR" "$stage" ;;
+  esac
+}
+
+build_final_context() {
+  local state_file="$1"
+  local pipeline_dir prompt_file final_file draft_file review_file
+  pipeline_dir="$(read_json_field "$state_file" pipeline_dir)"
+  prompt_file="$(read_json_field "$state_file" prompt_file)"
+  draft_file="$(read_json_field "$state_file" current_draft_file)"
+  review_file="$pipeline_dir/tmux-review.md"
+  final_file="$pipeline_dir/final-context.md"
+
+  {
+    printf '# Tmux Pipeline Final Context\n\n'
+    printf -- '- Pipeline ID: `%s`\n' "$(read_json_field "$state_file" pipeline_id)"
+    printf -- '- Provider: `%s`\n' "$(read_json_field "$state_file" provider)"
+    printf -- '- Mode: `%s`\n\n' "$(read_json_field "$state_file" mode)"
+    printf '## Owner Prompt\n\n'
+    if [[ -f "$prompt_file" ]]; then sed -n '1,20000p' "$prompt_file"; fi
+    printf '\n\n## Tmux Work\n\n'
+    {
+      [[ -f "$pipeline_dir/tmux-initial.md" ]] && printf '%s\n' "$pipeline_dir/tmux-initial.md"
+      find "$pipeline_dir" -maxdepth 1 -type f -name 'tmux-followup-*.md' | sort
+    } | while IFS= read -r file; do
+      printf '### `%s`\n\n' "$(basename "$file")"
+      sed -n '1,20000p' "$file"
+      printf '\n\n'
+    done
+    if find "$pipeline_dir" -maxdepth 1 -type f -name 'user-answer-*.md' | rg -q .; then
+      printf '## User Answers\n\n'
+      find "$pipeline_dir" -maxdepth 1 -type f -name 'user-answer-*.md' | sort | while IFS= read -r file; do
+        printf '### `%s`\n\n' "$(basename "$file")"
+        sed -n '1,20000p' "$file"
+        printf '\n\n'
+      done
+    fi
+    if [[ -n "$draft_file" && -f "$draft_file" ]]; then
+      printf '## Owner Draft Sent For Review\n\n'
+      sed -n '1,20000p' "$draft_file"
+      printf '\n\n'
+    fi
+    if [[ -f "$review_file" ]]; then
+      printf '## Tmux Review\n\n'
+      sed -n '1,20000p' "$review_file"
+      printf '\n\n'
+    fi
+  } > "$final_file"
+  state_set "$state_file" "final_context_file=$final_file"
+  printf '%s\n' "$final_file"
+}
+
+handle_response() {
+  local provider="$1" stage="$2" response_file="$3"
+  local seq artifact response_count final_context
+  eval "$(parse_response_assignments "$response_file")"
+
+  response_count="$(read_json_field "$PIPELINE_STATE_FILE" response_count)"
+  [[ "$response_count" =~ ^[0-9]+$ ]] || response_count=0
+  response_count="$((response_count + 1))"
+  seq="$(read_json_field "$PIPELINE_STATE_FILE" question_seq)"
+  [[ "$seq" =~ ^[0-9]+$ ]] || seq=0
+  artifact="$(artifact_for_stage "$stage" "$seq")"
+  cp "$response_file" "$artifact"
+
+  state_set "$PIPELINE_STATE_FILE" \
+    "response_count=$response_count" \
+    "latest_pipeline_response=$artifact" \
+    "latest_response_file=$response_file"
+
+  case "$PARSED_STATUS" in
+    FINAL)
+      final_context="$(build_final_context "$PIPELINE_STATE_FILE")"
+      state_set "$PIPELINE_STATE_FILE" \
+        "status=ready_for_synthesis" \
+        "pending_question_seq=__DELETE__" \
+        "pending_consultant_question_id=__DELETE__" \
+        "pending_question=__DELETE__" \
+        "recommended_default=__DELETE__"
+      copy_state_indexes "$PIPELINE_STATE_FILE" "$provider" "$PROJECT_SLUG" "$(read_json_field "$PIPELINE_STATE_FILE" pipeline_id)"
+      info "PIPELINE_STATUS=ready_for_synthesis"
+      info "pipeline_id=$(read_json_field "$PIPELINE_STATE_FILE" pipeline_id)"
+      info "tmux_response=$artifact"
+      info "final_context=$final_context"
+      ;;
+    NEEDS_INPUT)
+      seq="$((seq + 1))"
+      state_set "$PIPELINE_STATE_FILE" \
+        "status=waiting_for_user" \
+        "question_seq=$seq" \
+        "pending_question_seq=$seq" \
+        "pending_consultant_question_id=$PARSED_CONSULTANT_QUESTION_ID" \
+        "pending_question=$PARSED_QUESTION" \
+        "recommended_default=$PARSED_RECOMMENDED"
+      copy_state_indexes "$PIPELINE_STATE_FILE" "$provider" "$PROJECT_SLUG" "$(read_json_field "$PIPELINE_STATE_FILE" pipeline_id)"
+      info "PIPELINE_STATUS=waiting_for_user"
+      info "pipeline_id=$(read_json_field "$PIPELINE_STATE_FILE" pipeline_id)"
+      info "question_seq=$seq"
+      info "consultant_question_id=$PARSED_CONSULTANT_QUESTION_ID"
+      info "question=$PARSED_QUESTION"
+      if [[ -n "$PARSED_RECOMMENDED" ]]; then
+        info "recommended_default=$PARSED_RECOMMENDED"
+      fi
+      exit 10
+      ;;
+    BLOCKED)
+      state_set "$PIPELINE_STATE_FILE" "status=blocked" "blocked_reason=consultant returned BLOCKED"
+      copy_state_indexes "$PIPELINE_STATE_FILE" "$provider" "$PROJECT_SLUG" "$(read_json_field "$PIPELINE_STATE_FILE" pipeline_id)"
+      info "PIPELINE_STATUS=blocked"
+      info "pipeline_id=$(read_json_field "$PIPELINE_STATE_FILE" pipeline_id)"
+      info "tmux_response=$artifact"
+      exit 20
+      ;;
+    PARSE_ERROR)
+      state_set "$PIPELINE_STATE_FILE" "status=blocked" "blocked_reason=response parse error: $PARSE_ERROR"
+      copy_state_indexes "$PIPELINE_STATE_FILE" "$provider" "$PROJECT_SLUG" "$(read_json_field "$PIPELINE_STATE_FILE" pipeline_id)"
+      info "PIPELINE_STATUS=blocked"
+      info "pipeline_id=$(read_json_field "$PIPELINE_STATE_FILE" pipeline_id)"
+      info "parse_error=$PARSE_ERROR"
+      info "tmux_response=$artifact"
+      exit 20
+      ;;
+    *)
+      die 20 "unexpected parsed status: $PARSED_STATUS"
+      ;;
+  esac
+}
+
+find_state_by_id() {
+  local provider="$1" pipeline_id="$2" cwd="$3" cwd_mode="$4"
+  local resolved project_slug matches=()
+  if [[ -n "$cwd" ]]; then
+    resolved="$(resolve_cwd "$cwd" "$cwd_mode")"
+    if [[ -f "$resolved/.omx/tmux-pipelines/$pipeline_id/state.json" ]]; then
+      printf '%s\n' "$resolved/.omx/tmux-pipelines/$pipeline_id/state.json"
+      return
+    fi
+    project_slug="$(project_slug_from_path "$resolved")"
+    if [[ -f "$PIPELINE_STATE_ROOT/$provider/$project_slug/$pipeline_id.json" ]]; then
+      printf '%s\n' "$PIPELINE_STATE_ROOT/$provider/$project_slug/$pipeline_id.json"
+      return
+    fi
+  fi
+  mapfile -t matches < <(find "$PIPELINE_STATE_ROOT" -path "*/$pipeline_id.json" -type f 2>/dev/null | sort)
+  if (( ${#matches[@]} == 1 )); then
+    printf '%s\n' "${matches[0]}"
+    return
+  fi
+  if (( ${#matches[@]} > 1 )); then
+    printf 'Ambiguous pipeline id %s:\n' "$pipeline_id" >&2
+    printf '  %s\n' "${matches[@]}" >&2
+    die 2 "rerun with --provider and --cwd"
+  fi
+  die 2 "no state found for pipeline id: $pipeline_id"
+}
+
+find_unique_active_state() {
+  local provider="$1" cwd="$2" cwd_mode="$3"
+  local resolved project_slug matches=()
+  if [[ -n "$cwd" ]]; then
+    resolved="$(resolve_cwd "$cwd" "$cwd_mode")"
+    project_slug="$(project_slug_from_path "$resolved")"
+    mapfile -t matches < <(find "$PIPELINE_STATE_ROOT/$provider/$project_slug" -maxdepth 1 -type f -name '*.json' 2>/dev/null | sort)
+  elif [[ -f "$PIPELINE_STATE_ROOT/current.json" ]]; then
+    local current_state
+    current_state="$(read_json_field "$PIPELINE_STATE_ROOT/current.json" global_state_file)"
+    if [[ -n "$current_state" && -f "$current_state" ]]; then
+      matches=("$current_state")
+    fi
+  fi
+  if (( ${#matches[@]} == 1 )); then
+    printf '%s\n' "${matches[0]}"
+    return
+  fi
+  if (( ${#matches[@]} > 1 )); then
+    printf 'Ambiguous active pipelines:\n' >&2
+    printf '  %s\n' "${matches[@]}" >&2
+    die 2 "rerun with --pipeline-id"
+  fi
+  die 2 "no unique active pipeline found; rerun with --pipeline-id"
+}
+
+load_state_context() {
+  local state_file="$1"
+  PIPELINE_STATE_FILE="$state_file"
+  PIPELINE_DIR="$(read_json_field "$state_file" pipeline_dir)"
+  PROJECT_SLUG="$(read_json_field "$state_file" project_slug)"
+  CONSULTANT_KEY="$(read_json_field "$state_file" consultant_key)"
+}
+
+cmd_start() {
+  local provider mode key="" pipeline_id="" cwd="" cwd_mode="project" prompt="" prompt_file="" release_policy="manual" stub="false" stub_status="" stub_question="" stub_recommended="" ready_timeout="45" wait_timeout="600" auto_trust="false" dry_run="false" fresh="false" replace="false"
+  local materials=()
+  provider="$(invoked_provider)"
+  mode="$(invoked_mode)"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --provider) provider="$2"; shift 2 ;;
+      --mode) mode="$2"; shift 2 ;;
+      --pipeline-id) pipeline_id="$2"; shift 2 ;;
+      --key) key="$2"; shift 2 ;;
+      --cwd) cwd="$2"; shift 2 ;;
+      --cwd-mode) cwd_mode="$2"; shift 2 ;;
+      --prompt) prompt="$2"; shift 2 ;;
+      --prompt-file) prompt_file="$2"; shift 2 ;;
+      --materials|--material) materials+=("$2"); shift 2 ;;
+      --release) release_policy="$2"; shift 2 ;;
+      --stub) stub="true"; shift ;;
+      --stub-status) stub_status="$2"; shift 2 ;;
+      --stub-question) stub_question="$2"; shift 2 ;;
+      --stub-recommended) stub_recommended="$2"; shift 2 ;;
+      --ready-timeout) ready_timeout="$2"; shift 2 ;;
+      --wait-timeout) wait_timeout="$2"; shift 2 ;;
+      --auto-trust) auto_trust="true"; shift ;;
+      --dry-run) dry_run="true"; shift ;;
+      --fresh) fresh="true"; shift ;;
+      --replace) replace="true"; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die 2 "unknown start option: $1" ;;
+    esac
+  done
+  [[ -n "$provider" ]] || die 2 "--provider is required"
+  [[ "$provider" == "claude" || "$provider" == "codex" ]] || die 2 "provider must be claude or codex"
+  mode="$(normalize_mode "$mode")"
+  local prompt_text resolved prompt_path response_file review_requested
+  prompt_text="$(read_text_arg "$prompt" "$prompt_file")" || die 2 "start requires --prompt or --prompt-file"
+  resolved="$(resolve_cwd "$cwd" "$cwd_mode" "${materials[@]+"${materials[@]}"}")"
+  [[ -n "$pipeline_id" ]] || pipeline_id="$(new_pipeline_id "$provider" "$resolved" "$prompt_text")"
+  pipeline_id="$(slugify "$pipeline_id")"
+  [[ -n "$pipeline_id" ]] || die 2 "invalid --pipeline-id"
+  pipeline_paths "$resolved" "$provider" "$pipeline_id"
+  [[ -n "$key" ]] && CONSULTANT_KEY="$key"
+  review_requested="false"
+  [[ "$mode" == "review" ]] && review_requested="true"
+
+  if [[ "$dry_run" == "true" ]]; then
+    info "DRY_RUN provider=$provider"
+    info "DRY_RUN mode=$mode"
+    info "DRY_RUN cwd=$resolved"
+    info "DRY_RUN pipeline_id=$pipeline_id"
+    info "DRY_RUN pipeline_dir=$PIPELINE_DIR"
+    info "DRY_RUN consultant_key=$CONSULTANT_KEY"
+    return
+  fi
+
+  mkdir -p "$PIPELINE_DIR"
+  prompt_path="$PIPELINE_DIR/prompt.md"
+  printf '%s\n' "$prompt_text" > "$prompt_path"
+  state_set "$PIPELINE_STATE_FILE" \
+    "schema=ask_tmux_pipeline.v1" \
+    "provider=$provider" \
+    "pipeline_id=$pipeline_id" \
+    "mode=$mode" \
+    "cwd=$resolved" \
+    "project_slug=$PROJECT_SLUG" \
+    "pipeline_dir=$PIPELINE_DIR" \
+    "consultant_key=$CONSULTANT_KEY" \
+    "status=initializing" \
+    "prompt_file=$prompt_path" \
+    "review_requested=$review_requested" \
+    "question_seq=0" \
+    "response_count=0"
+
+  copy_state_indexes "$PIPELINE_STATE_FILE" "$provider" "$PROJECT_SLUG" "$pipeline_id"
+  response_file="$(run_consultant "$provider" "$mode" "initial" "$resolved" "$CONSULTANT_KEY" "$release_policy" "$stub" "$stub_status" "$stub_question" "$stub_recommended" "$ready_timeout" "$wait_timeout" "$auto_trust" "$fresh" "$replace" "$prompt_path" "${materials[@]+"${materials[@]}"}")"
+  handle_response "$provider" "initial" "$response_file"
+}
+
+cmd_answer() {
+  local provider pipeline_id="" cwd="" cwd_mode="project" answer="" answer_file="" release_policy="manual" stub="false" stub_status="" stub_question="" stub_recommended="" ready_timeout="45" wait_timeout="600" auto_trust="false"
+  provider="$(invoked_provider)"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --provider) provider="$2"; shift 2 ;;
+      --pipeline-id) pipeline_id="$2"; shift 2 ;;
+      --cwd) cwd="$2"; shift 2 ;;
+      --cwd-mode) cwd_mode="$2"; shift 2 ;;
+      --answer) answer="$2"; shift 2 ;;
+      --answer-file) answer_file="$2"; shift 2 ;;
+      --release) release_policy="$2"; shift 2 ;;
+      --stub) stub="true"; shift ;;
+      --stub-status) stub_status="$2"; shift 2 ;;
+      --stub-question) stub_question="$2"; shift 2 ;;
+      --stub-recommended) stub_recommended="$2"; shift 2 ;;
+      --ready-timeout) ready_timeout="$2"; shift 2 ;;
+      --wait-timeout) wait_timeout="$2"; shift 2 ;;
+      --auto-trust) auto_trust="true"; shift ;;
+      *) die 2 "unknown answer option: $1" ;;
+    esac
+  done
+  [[ -n "$provider" ]] || die 2 "--provider is required"
+  local state_file status seq answer_text answer_path response_file prompt_file latest_response mode cwd_state
+  if [[ -n "$pipeline_id" ]]; then
+    state_file="$(find_state_by_id "$provider" "$pipeline_id" "$cwd" "$cwd_mode")"
+  else
+    state_file="$(find_unique_active_state "$provider" "$cwd" "$cwd_mode")"
+  fi
+  load_state_context "$state_file"
+  status="$(read_json_field "$state_file" status)"
+  [[ "$status" == "waiting_for_user" ]] || die 2 "pipeline is not waiting for user input; status=$status"
+  answer_text="$(read_text_arg "$answer" "$answer_file")" || die 2 "answer requires --answer or --answer-file"
+  seq="$(read_json_field "$state_file" pending_question_seq)"
+  [[ "$seq" =~ ^[0-9]+$ ]] || die 2 "missing pending question sequence"
+  answer_path="$PIPELINE_DIR/user-answer-$(printf '%03d' "$seq").md"
+  {
+    printf '# User Answer\n\n'
+    printf -- '- Question sequence: `%s`\n' "$seq"
+    printf -- '- Consultant question id: `%s`\n\n' "$(read_json_field "$state_file" pending_consultant_question_id)"
+    printf '## Question\n\n%s\n\n' "$(read_json_field "$state_file" pending_question)"
+    printf '## Answer\n\n%s\n' "$answer_text"
+  } > "$answer_path"
+  prompt_file="$(read_json_field "$state_file" prompt_file)"
+  latest_response="$(read_json_field "$state_file" latest_pipeline_response)"
+  mode="$(read_json_field "$state_file" mode)"
+  cwd_state="$(read_json_field "$state_file" cwd)"
+  response_file="$(run_consultant "$provider" "$mode" "followup" "$cwd_state" "$CONSULTANT_KEY" "$release_policy" "$stub" "$stub_status" "$stub_question" "$stub_recommended" "$ready_timeout" "$wait_timeout" "$auto_trust" "false" "false" "$prompt_file" "$latest_response" "$answer_path")"
+  handle_response "$provider" "followup" "$response_file"
+}
+
+cmd_review() {
+  local provider pipeline_id="" cwd="" cwd_mode="project" draft="" draft_file="" release_policy="manual" stub="false" stub_status="" stub_question="" stub_recommended="" ready_timeout="45" wait_timeout="600" auto_trust="false"
+  provider="$(invoked_provider)"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --provider) provider="$2"; shift 2 ;;
+      --pipeline-id) pipeline_id="$2"; shift 2 ;;
+      --cwd) cwd="$2"; shift 2 ;;
+      --cwd-mode) cwd_mode="$2"; shift 2 ;;
+      --draft) draft="$2"; shift 2 ;;
+      --draft-file) draft_file="$2"; shift 2 ;;
+      --release) release_policy="$2"; shift 2 ;;
+      --stub) stub="true"; shift ;;
+      --stub-status) stub_status="$2"; shift 2 ;;
+      --stub-question) stub_question="$2"; shift 2 ;;
+      --stub-recommended) stub_recommended="$2"; shift 2 ;;
+      --ready-timeout) ready_timeout="$2"; shift 2 ;;
+      --wait-timeout) wait_timeout="$2"; shift 2 ;;
+      --auto-trust) auto_trust="true"; shift ;;
+      *) die 2 "unknown review option: $1" ;;
+    esac
+  done
+  [[ -n "$provider" ]] || die 2 "--provider is required"
+  local state_file status draft_text draft_path prompt_file latest_response mode cwd_state response_file
+  if [[ -n "$pipeline_id" ]]; then
+    state_file="$(find_state_by_id "$provider" "$pipeline_id" "$cwd" "$cwd_mode")"
+  else
+    state_file="$(find_unique_active_state "$provider" "$cwd" "$cwd_mode")"
+  fi
+  load_state_context "$state_file"
+  status="$(read_json_field "$state_file" status)"
+  [[ "$status" == "ready_for_synthesis" ]] || die 2 "pipeline is not ready for review; status=$status"
+  draft_text="$(read_text_arg "$draft" "$draft_file")" || die 2 "review requires --draft or --draft-file"
+  draft_path="$PIPELINE_DIR/current-draft.md"
+  printf '%s\n' "$draft_text" > "$draft_path"
+  state_set "$state_file" "status=reviewing" "current_draft_file=$draft_path" "review_requested=true"
+  prompt_file="$(read_json_field "$state_file" prompt_file)"
+  latest_response="$(read_json_field "$state_file" latest_pipeline_response)"
+  mode="$(read_json_field "$state_file" mode)"
+  cwd_state="$(read_json_field "$state_file" cwd)"
+  response_file="$(run_consultant "$provider" "$mode" "review" "$cwd_state" "$CONSULTANT_KEY" "$release_policy" "$stub" "$stub_status" "$stub_question" "$stub_recommended" "$ready_timeout" "$wait_timeout" "$auto_trust" "false" "false" "$prompt_file" "$latest_response" "$draft_path")"
+  handle_response "$provider" "review" "$response_file"
+}
+
+cmd_status() {
+  local provider="" pipeline_id="" cwd="" cwd_mode="project" state_file
+  provider="$(invoked_provider)"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --provider) provider="$2"; shift 2 ;;
+      --pipeline-id) pipeline_id="$2"; shift 2 ;;
+      --cwd) cwd="$2"; shift 2 ;;
+      --cwd-mode) cwd_mode="$2"; shift 2 ;;
+      *) die 2 "unknown status option: $1" ;;
+    esac
+  done
+  if [[ -n "$pipeline_id" ]]; then
+    state_file="$(find_state_by_id "$provider" "$pipeline_id" "$cwd" "$cwd_mode")"
+  else
+    state_file="$(find_unique_active_state "$provider" "$cwd" "$cwd_mode")"
+  fi
+  python3 - "$state_file" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as handle:
+    state = json.load(handle)
+for key in [
+    "status",
+    "provider",
+    "pipeline_id",
+    "mode",
+    "cwd",
+    "consultant_key",
+    "pending_question_seq",
+    "pending_question",
+    "recommended_default",
+    "latest_pipeline_response",
+    "final_context_file",
+    "blocked_reason",
+]:
+    value = state.get(key)
+    if value not in (None, ""):
+        print(f"{key}={value}")
+print(f"state_file={sys.argv[1]}")
+PY
+}
+
+cmd_resume() {
+  local provider="" pipeline_id="" cwd="" cwd_mode="project" state_file status
+  provider="$(invoked_provider)"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --provider) provider="$2"; shift 2 ;;
+      --pipeline-id) pipeline_id="$2"; shift 2 ;;
+      --cwd) cwd="$2"; shift 2 ;;
+      --cwd-mode) cwd_mode="$2"; shift 2 ;;
+      *) die 2 "unknown resume option: $1" ;;
+    esac
+  done
+  if [[ -n "$pipeline_id" ]]; then
+    state_file="$(find_state_by_id "$provider" "$pipeline_id" "$cwd" "$cwd_mode")"
+  else
+    state_file="$(find_unique_active_state "$provider" "$cwd" "$cwd_mode")"
+  fi
+  status="$(read_json_field "$state_file" status)"
+  cmd_status --provider "$(read_json_field "$state_file" provider)" --pipeline-id "$(read_json_field "$state_file" pipeline_id)" --cwd "$(read_json_field "$state_file" cwd)" --cwd-mode current
+  case "$status" in
+    waiting_for_user) exit 10 ;;
+    blocked) exit 20 ;;
+    *) exit 0 ;;
+  esac
+}
+
+cmd_final_context() {
+  local provider="" pipeline_id="" cwd="" cwd_mode="project" state_file final_file
+  provider="$(invoked_provider)"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --provider) provider="$2"; shift 2 ;;
+      --pipeline-id) pipeline_id="$2"; shift 2 ;;
+      --cwd) cwd="$2"; shift 2 ;;
+      --cwd-mode) cwd_mode="$2"; shift 2 ;;
+      *) die 2 "unknown final-context option: $1" ;;
+    esac
+  done
+  if [[ -n "$pipeline_id" ]]; then
+    state_file="$(find_state_by_id "$provider" "$pipeline_id" "$cwd" "$cwd_mode")"
+  else
+    state_file="$(find_unique_active_state "$provider" "$cwd" "$cwd_mode")"
+  fi
+  final_file="$(build_final_context "$state_file")"
+  info "final_context=$final_file"
+  sed -n '1,20000p' "$final_file"
+}
+
+cmd_doctor() {
+  local failed=0
+  info "ask-tmux-pipeline version=$VERSION"
+  if [[ -x "$BASE_RUNNER" ]]; then info "PASS base_runner=$BASE_RUNNER"; else info "FAIL base_runner_not_executable=$BASE_RUNNER"; failed=1; fi
+  if command -v tmux >/dev/null; then info "PASS tmux=$(tmux -V)"; else info "FAIL tmux missing"; failed=1; fi
+  if command -v rg >/dev/null; then info "PASS rg=$(command -v rg)"; else info "FAIL rg missing"; failed=1; fi
+  if command -v python3 >/dev/null; then info "PASS python3=$(command -v python3)"; else info "FAIL python3 missing"; failed=1; fi
+  mkdir -p "$PIPELINE_STATE_ROOT" 2>/dev/null || true
+  if [[ -w "$PIPELINE_STATE_ROOT" ]]; then info "PASS pipeline_state_root=$PIPELINE_STATE_ROOT"; else info "FAIL pipeline_state_root_not_writable=$PIPELINE_STATE_ROOT"; failed=1; fi
+  for wrapper in "$SCRIPT_DIR/ask-tmux-claude-pipeline" "$SCRIPT_DIR/ask-tmux-codex-pipeline" "$SCRIPT_DIR/ask-tmux-claude-pure" "$SCRIPT_DIR/ask-tmux-codex-pure"; do
+    if [[ -x "$wrapper" ]]; then info "PASS wrapper=$wrapper"; else info "FAIL wrapper_missing_or_not_executable=$wrapper"; failed=1; fi
+  done
+  return "$failed"
+}
+
+main() {
+  local command="${1:-}"
+  if [[ -z "$command" ]]; then
+    usage
+    exit 2
+  fi
+  if [[ "$command" == --* ]]; then
+    command="start"
+  else
+    shift || true
+  fi
+  case "$command" in
+    start) cmd_start "$@" ;;
+    answer) cmd_answer "$@" ;;
+    review) cmd_review "$@" ;;
+    status) cmd_status "$@" ;;
+    resume) cmd_resume "$@" ;;
+    final-context) cmd_final_context "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    -h|--help|help) usage ;;
+    *) die 2 "unknown command: $command" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

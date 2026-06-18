@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ask Tmux Claude"
+  short_description: "Ask Claude through a reusable tmux consultant reviewer session"
+  default_prompt: "Use ask-tmux-claude for ask-Claude, Claude review/comment/suggest, external Claude reviewer, consultant Claude session, ask Claude in tmux, and repeated Claude consultation requests."

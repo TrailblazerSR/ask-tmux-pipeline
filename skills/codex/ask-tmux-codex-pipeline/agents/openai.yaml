@@ -1,0 +1,4 @@
+interface:
+  display_name: "Ask Tmux Codex Pipeline"
+  short_description: "Pipeline prompts through tmux Codex"
+  default_prompt: "Use $ask-tmux-codex-pipeline to send this prompt through tmux Codex and synthesize the result."

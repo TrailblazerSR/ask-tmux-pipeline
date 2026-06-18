@@ -1,0 +1,1090 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+VERSION="0.2.0"
+STATE_ROOT="${ASK_TMUX_STATE_ROOT:-$HOME/.omx/state/consultants}"
+ARTIFACT_ROOT="${ASK_TMUX_ARTIFACT_ROOT:-$HOME/.omx/artifacts/consultants}"
+LOG_PATH="${ASK_TMUX_LOG_PATH:-$HOME/.omx/consultants/log.jsonl}"
+PACKET_LIMIT_BYTES="${ASK_TMUX_PACKET_LIMIT_BYTES:-65536}"
+READY_TIMEOUT_SECONDS="${ASK_TMUX_READY_TIMEOUT_SECONDS:-45}"
+WAIT_TIMEOUT_SECONDS="${ASK_TMUX_WAIT_TIMEOUT_SECONDS:-600}"
+
+usage() {
+  cat <<'USAGE'
+ask-tmux-consultant <command> [options]
+
+Commands:
+  send      Create a packet and send a prompt to a reusable tmux consultant
+  status    Show consultant session state
+  capture   Capture consultant tmux pane output
+  attach    Print or run tmux attach for a consultant session
+  release   Kill managed consultant tmux session(s)
+  cleanup   Release stale managed consultant sessions
+  gc        Alias for cleanup
+  doctor    Check tmux, provider CLI, runner helpers, and state paths
+
+Common options:
+  --provider claude|codex
+  --key NAME
+  --cwd PATH
+  --cwd-mode project|parent|git|current
+  --materials PATH|-       Repeatable. Directories are listed, small files/stdin are embedded.
+  --prompt TEXT
+  --task review|comment|plan|debug|custom
+  --fresh                  Refuse if a same-key live session exists unless --replace is also set.
+  --replace                With --fresh, release the same-key live session before launching.
+  --reuse                  Reuse same-key live session. Default for send.
+  --stub                   Launch a no-cost shell stub instead of Claude/Codex.
+  --wait / --no-wait       Wait for done sentinel and print response file. Default: wait.
+  --wait-timeout SECONDS
+  --ready-timeout SECONDS
+  --auto-trust             Press Enter on Claude workspace trust prompt.
+  --dry-run
+  --all                    For status/release.
+  --stale-after DURATION   For cleanup, e.g. 24h, 30m, 3600s.
+USAGE
+}
+
+die() {
+  printf 'ERROR: %s\n' "$*" >&2
+  exit 1
+}
+
+warn() {
+  printf 'WARN: %s\n' "$*" >&2
+}
+
+info() {
+  printf '%s\n' "$*"
+}
+
+json_escape() {
+  if command -v python3 >/dev/null 2>&1; then
+    JSON_VALUE="$1" python3 - <<'PY'
+import json
+import os
+import sys
+
+sys.stdout.write(json.dumps(os.environ.get("JSON_VALUE", ""))[1:-1])
+PY
+  else
+    printf '%s' "$1" | sed ':a;N;$!ba; s/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g; s/\r/\\r/g; s/\n/\\n/g'
+  fi
+}
+
+slugify() {
+  printf '%s' "$1" \
+    | tr '[:upper:]' '[:lower:]' \
+    | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//; s/-+/-/g' \
+    | cut -c1-64
+}
+
+short_hash() {
+  printf '%s' "$1" | sha1sum | awk '{print substr($1,1,8)}'
+}
+
+key_id_from_key() {
+  local key="$1" base hash
+  base="$(slugify "$key")"
+  [[ -n "$base" ]] || base="default"
+  hash="$(short_hash "$key")"
+  printf '%s-%s\n' "$(printf '%s' "$base" | cut -c1-55)" "$hash"
+}
+
+legacy_key_slug_from_key() {
+  local key="$1" base
+  base="$(slugify "$key")"
+  [[ -n "$base" ]] || base="default"
+  printf '%s\n' "$base"
+}
+
+project_slug_from_path() {
+  local resolved="$1" base hash
+  base="$(slugify "$(basename "$resolved")")"
+  [[ -n "$base" ]] || base="root"
+  hash="$(short_hash "$resolved")"
+  printf '%s-%s\n' "$base" "$hash"
+}
+
+duration_to_seconds() {
+  local value="$1"
+  case "$value" in
+    *h) printf '%s\n' "$(( ${value%h} * 3600 ))" ;;
+    *m) printf '%s\n' "$(( ${value%m} * 60 ))" ;;
+    *s) printf '%s\n' "${value%s}" ;;
+    '' ) printf '86400\n' ;;
+    *[!0-9]* ) die "invalid duration: $value" ;;
+    * ) printf '%s\n' "$value" ;;
+  esac
+}
+
+invoked_provider() {
+  case "$(basename "$0")" in
+    ask-tmux-claude|ask-tux-claude) printf 'claude\n' ;;
+    ask-tmux-codex) printf 'codex\n' ;;
+    *) printf '\n' ;;
+  esac
+}
+
+find_project_root() {
+  local start="$1"
+  local dir
+  dir="$(realpath -m "$start")"
+  while true; do
+    for marker in AGENTS.md CLAUDE.md .git .bioagent pyproject.toml package.json; do
+      if [[ -e "$dir/$marker" ]]; then
+        printf '%s\n' "$dir"
+        return
+      fi
+    done
+    [[ "$dir" == "/" ]] && break
+    dir="$(dirname "$dir")"
+  done
+  realpath -m "$start"
+}
+
+first_material_base() {
+  local material
+	  for material in "$@"; do
+	    [[ "$material" == "-" ]] && continue
+	    if [[ -d "$material" ]]; then
+	      realpath -m "$material"
+	      return
+	    fi
+    if [[ -e "$material" ]]; then
+      dirname "$(realpath -m "$material")"
+      return
+    fi
+  done
+  pwd
+}
+
+resolve_cwd() {
+  local explicit_cwd="$1"
+  local mode="$2"
+  shift 2
+  local base root parent git_root
+  if [[ -n "$explicit_cwd" ]]; then
+    base="$(realpath -m "$explicit_cwd")"
+  else
+    base="$(first_material_base "$@")"
+  fi
+
+  case "$mode" in
+    current)
+      if [[ -n "$explicit_cwd" ]]; then
+        root="$base"
+      else
+        root="$(pwd)"
+      fi
+      ;;
+    git)
+      if git_root="$(git -C "$base" rev-parse --show-toplevel 2>/dev/null)"; then
+        root="$git_root"
+      else
+        root="$(find_project_root "$base")"
+      fi
+      ;;
+    parent|project)
+      root="$(find_project_root "$base")"
+      ;;
+    *)
+      die "unknown --cwd-mode: $mode"
+      ;;
+  esac
+
+  if [[ "$mode" == "parent" ]]; then
+    parent="$(dirname "$root")"
+    if [[ "$parent" == "$root" ]]; then
+      warn "cannot use parent of $root; using $root"
+    else
+      root="$parent"
+    fi
+  fi
+  realpath -m "$root"
+}
+
+template_prompt() {
+  local task="$1"
+	  case "$task" in
+	    review)
+	      printf 'Review, comment, and suggest. Return verdict, high/medium/low findings with evidence, missing verification, risks, concrete suggestions, and prioritized next actions.'
+      ;;
+    comment)
+      printf 'Comment on the supplied material. Focus on correctness, assumptions, gaps, risks, and concise actionable suggestions.'
+      ;;
+    plan)
+      printf 'Assess the plan. Challenge scope, lifecycle, risks, alternatives, acceptance criteria, and verification before implementation.'
+      ;;
+    debug)
+      printf 'Debug or diagnose the supplied issue. Identify likely root causes, evidence needed, safe probes, and next actions. Stay read-only unless explicitly authorized.'
+      ;;
+    custom)
+      printf 'Follow the owner prompt in the packet. Preserve the safety boundary.'
+      ;;
+    *)
+      die "unknown --task: $task"
+      ;;
+  esac
+}
+
+session_exists() {
+  tmux has-session -t "$1" 2>/dev/null
+}
+
+state_file_for() {
+  local provider="$1" project_slug="$2" key_id="$3"
+  printf '%s/%s/%s/%s.json\n' "$STATE_ROOT" "$provider" "$project_slug" "$key_id"
+}
+
+write_state() {
+  local file="$1" provider="$2" key="$3" project_slug="$4" session="$5" pane="$6" cwd="$7" packet="$8" status="$9" release_policy="${10}" ttl="${11:-}" response_path="${12:-}" busy="${13:-false}" started_epoch="${14:-}" completed_epoch="${15:-}" done_sentinel="${16:-}"
+  local now epoch tmp completed_value
+  now="$(date -Is)"
+  epoch="$(date +%s)"
+  [[ -n "$started_epoch" ]] || started_epoch="$epoch"
+  if [[ -n "$completed_epoch" ]]; then
+    completed_value="$completed_epoch"
+  else
+    completed_value="null"
+  fi
+  mkdir -p "$(dirname "$file")"
+  tmp="${file}.$$.$RANDOM.tmp"
+  {
+    printf '{\n'
+    printf '  "schema": "ask_tmux_consultant.v1",\n'
+    printf '  "provider": "%s",\n' "$(json_escape "$provider")"
+    printf '  "key": "%s",\n' "$(json_escape "$key")"
+    printf '  "project_slug": "%s",\n' "$(json_escape "$project_slug")"
+    printf '  "session_name": "%s",\n' "$(json_escape "$session")"
+    printf '  "pane_target": "%s",\n' "$(json_escape "$pane")"
+    printf '  "cwd": "%s",\n' "$(json_escape "$cwd")"
+    printf '  "cwd_resolved": "%s",\n' "$(json_escape "$(realpath -m "$cwd")")"
+    printf '  "last_packet": "%s",\n' "$(json_escape "$packet")"
+    printf '  "last_response": "%s",\n' "$(json_escape "$response_path")"
+    printf '  "done_sentinel": "%s",\n' "$(json_escape "$done_sentinel")"
+    printf '  "release_policy": "%s",\n' "$(json_escape "$release_policy")"
+    printf '  "ttl": "%s",\n' "$(json_escape "$ttl")"
+    printf '  "status": "%s",\n' "$(json_escape "$status")"
+    printf '  "busy": %s,\n' "$busy"
+    printf '  "started_epoch": %s,\n' "$started_epoch"
+    printf '  "completed_epoch": %s,\n' "$completed_value"
+    printf '  "last_used_epoch": %s,\n' "$epoch"
+    printf '  "updated_at": "%s"\n' "$(json_escape "$now")"
+    printf '}\n'
+  } > "$tmp"
+  mv "$tmp" "$file"
+}
+
+read_json_field() {
+  local file="$1" field="$2"
+  [[ -f "$file" ]] || return 0
+  python3 - "$file" "$field" <<'PY'
+import json
+import sys
+
+path, field = sys.argv[1], sys.argv[2]
+try:
+    with open(path, "r", encoding="utf-8") as handle:
+        value = json.load(handle).get(field)
+except Exception:
+    value = None
+if isinstance(value, str):
+    sys.stdout.write(value)
+elif value is not None:
+    sys.stdout.write(str(value))
+PY
+}
+
+read_json_number() {
+  local file="$1" field="$2"
+  [[ -f "$file" ]] || return 0
+  python3 - "$file" "$field" <<'PY'
+import json
+import sys
+
+path, field = sys.argv[1], sys.argv[2]
+try:
+    with open(path, "r", encoding="utf-8") as handle:
+        value = json.load(handle).get(field)
+except Exception:
+    value = None
+if isinstance(value, (int, float)) and not isinstance(value, bool):
+    sys.stdout.write(str(int(value)))
+PY
+}
+
+read_json_bool() {
+  local file="$1" field="$2"
+  [[ -f "$file" ]] || return 0
+  python3 - "$file" "$field" <<'PY'
+import json
+import sys
+
+path, field = sys.argv[1], sys.argv[2]
+try:
+    with open(path, "r", encoding="utf-8") as handle:
+        value = json.load(handle).get(field)
+except Exception:
+    value = None
+if isinstance(value, bool):
+    sys.stdout.write("true" if value else "false")
+PY
+}
+
+response_file_is_fresh() {
+  local response_path="$1" min_response_epoch="${2:-0}" mtime
+  [[ -f "$response_path" ]] || return 1
+  [[ "$min_response_epoch" =~ ^[0-9]+$ ]] || min_response_epoch=0
+  mtime="$(stat -c %Y "$response_path" 2>/dev/null || printf 0)"
+  [[ "$mtime" =~ ^[0-9]+$ ]] || mtime=0
+  (( mtime >= min_response_epoch ))
+}
+
+log_event() {
+  local event="$1" provider="$2" session="$3" status="$4" detail="${5:-}"
+  mkdir -p "$(dirname "$LOG_PATH")"
+  printf '{"ts":"%s","event":"%s","provider":"%s","session":"%s","status":"%s","detail":"%s"}\n' \
+    "$(date -Is)" "$(json_escape "$event")" "$(json_escape "$provider")" "$(json_escape "$session")" "$(json_escape "$status")" "$(json_escape "$detail")" >> "$LOG_PATH"
+}
+
+state_search_roots() {
+  local provider="$1" project_slug="${2:-}"
+  [[ -d "$STATE_ROOT" ]] || return
+  if [[ -n "$provider" && -n "$project_slug" ]]; then
+    [[ -d "$STATE_ROOT/$provider/$project_slug" ]] && printf '%s\n' "$STATE_ROOT/$provider/$project_slug"
+  elif [[ -n "$provider" ]]; then
+    [[ -d "$STATE_ROOT/$provider" ]] && printf '%s\n' "$STATE_ROOT/$provider"
+  elif [[ -n "$project_slug" ]]; then
+    find "$STATE_ROOT" -mindepth 2 -maxdepth 2 -type d -name "$project_slug" 2>/dev/null | sort
+  else
+    printf '%s\n' "$STATE_ROOT"
+  fi
+}
+
+key_state_names() {
+  local key="$1" key_id legacy
+  key_id="$(key_id_from_key "$key")"
+  legacy="$(legacy_key_slug_from_key "$key")"
+  printf '%s.json\n' "$key_id"
+  if [[ "$legacy" != "$key_id" ]]; then
+    printf '%s.json\n' "$legacy"
+  fi
+}
+
+find_state_files() {
+  local provider="$1" key="${2:-}" all="${3:-false}" project_slug="${4:-}"
+  local root name
+  if [[ "$all" == "true" || -z "$key" ]]; then
+    while IFS= read -r root; do
+      [[ -n "$root" ]] || continue
+      find "$root" -type f -name '*.json' 2>/dev/null
+    done < <(state_search_roots "$provider" "$project_slug") | sort -u
+  else
+    while IFS= read -r root; do
+      [[ -n "$root" ]] || continue
+      while IFS= read -r name; do
+        [[ -n "$name" ]] || continue
+        find "$root" -type f -name "$name" 2>/dev/null
+      done < <(key_state_names "$key")
+    done < <(state_search_roots "$provider" "$project_slug") | sort -u
+  fi
+}
+
+prefer_hashed_state_file_if_same_project() {
+  local key="$1"
+  shift
+  local first_provider="" first_project="" file file_provider file_project preferred
+  for file in "$@"; do
+    file_provider="$(read_json_field "$file" provider)"
+    file_project="$(read_json_field "$file" project_slug)"
+    [[ -n "$file_provider" ]] || file_provider="$(basename "$(dirname "$(dirname "$file")")")"
+    [[ -n "$file_project" ]] || file_project="$(basename "$(dirname "$file")")"
+    if [[ -z "$first_provider" ]]; then
+      first_provider="$file_provider"
+      first_project="$file_project"
+    elif [[ "$file_provider" != "$first_provider" || "$file_project" != "$first_project" ]]; then
+      return 1
+    fi
+  done
+  preferred="$(state_file_for "$first_provider" "$first_project" "$(key_id_from_key "$key")")"
+  [[ -f "$preferred" ]] || return 1
+  printf '%s\n' "$preferred"
+}
+
+project_slug_for_optional_cwd() {
+  local cwd="$1" cwd_mode="$2"
+  if [[ -n "$cwd" ]]; then
+    project_slug_from_path "$(resolve_cwd "$cwd" "$cwd_mode")"
+  fi
+}
+
+select_state_file_for_key() {
+  local provider="$1" key="$2" cwd="$3" cwd_mode="$4" command_name="$5"
+  local project_slug matches=()
+  project_slug="$(project_slug_for_optional_cwd "$cwd" "$cwd_mode")"
+  mapfile -t matches < <(find_state_files "$provider" "$key" false "$project_slug")
+  if (( ${#matches[@]} == 0 )); then
+    die "no state file found for key: $key"
+  fi
+  if (( ${#matches[@]} > 1 )); then
+    local preferred
+    if preferred="$(prefer_hashed_state_file_if_same_project "$key" "${matches[@]}")"; then
+      printf '%s\n' "$preferred"
+      return
+    fi
+  fi
+  if (( ${#matches[@]} > 1 )); then
+    printf 'Ambiguous state files for --key %s:\n' "$key" >&2
+    printf '  %s\n' "${matches[@]}" >&2
+    die "$command_name needs a project selector; rerun with --cwd /path/to/project or use --all intentionally"
+  fi
+  printf '%s\n' "${matches[0]}"
+}
+
+provider_launch_command() {
+  local provider="$1" stub="$2"
+  if [[ "$stub" == "true" ]]; then
+    printf "%s" "bash -lc 'printf \"ASK_TMUX_STUB_READY\\n\"; while IFS= read -r line; do printf \"ASK_TMUX_STUB_RECEIVED:%s\\n\" \"\$line\"; response=\$(printf \"%s\" \"\$line\" | sed -n \"s/.*ASK_TMUX_RESPONSE=\\([^ ]*\\).*/\\1/p\"); sentinel=\$(printf \"%s\" \"\$line\" | sed -n \"s/.*ASK_TMUX_SENTINEL=\\([^ ]*\\).*/\\1/p\"); if [ -n \"\$response\" ]; then mkdir -p \"\$(dirname \"\$response\")\"; printf \"Stub consultant response for: %s\\n\" \"\$line\" > \"\$response\"; fi; if [ -n \"\$sentinel\" ]; then printf \"%s\\n\" \"\$sentinel\"; fi; done'"
+    return
+  fi
+  case "$provider" in
+    claude) printf '%s\n' "claude --dangerously-skip-permissions" ;;
+    codex) printf '%s\n' "codex --dangerously-bypass-approvals-and-sandbox" ;;
+    *) die "unknown provider: $provider" ;;
+  esac
+}
+
+write_limited_file_block() {
+  local file="$1" size="$2"
+  printf '```text\n'
+  if (( size <= PACKET_LIMIT_BYTES )); then
+    sed -n '1,2000p' "$file"
+    printf '\n```\n\n'
+  else
+    LC_ALL=C head -c "$PACKET_LIMIT_BYTES" "$file"
+    printf '\n```\n\n'
+    printf '_Material truncated: embedded first %s of %s bytes. Inspect the path above for the full content._\n\n' "$PACKET_LIMIT_BYTES" "$size"
+  fi
+}
+
+write_packet() {
+  local packet="$1" provider="$2" task="$3" cwd="$4" owner_prompt="$5" response_path="$6" done_sentinel="$7"
+  shift 7
+  local material size
+  mkdir -p "$(dirname "$packet")"
+  {
+    printf '# Ask Tmux Consultant Packet\n\n'
+    printf -- '- Provider: `%s`\n' "$provider"
+    printf -- '- Task: `%s`\n' "$task"
+    printf -- '- CWD: `%s`\n' "$cwd"
+    printf -- '- Created: `%s`\n\n' "$(date -Is)"
+    printf '## Owner Prompt\n\n%s\n\n' "$owner_prompt"
+	    printf '## Safety Boundary\n\n'
+    printf -- '- Default to read-only review/comment/suggest behavior.\n'
+	    printf -- '- The only write allowed by default is writing the required response file named in this packet.\n'
+	    printf -- '- Do not modify, create, delete, install, commit, push, submit jobs, or run destructive commands unless this packet explicitly grants a write scope.\n'
+	    printf -- '- Do not execute shell commands unless the task is debug/verification and the packet explicitly asks for safe read-only probes.\n'
+	    printf -- '- If edits or dangerous actions seem necessary, stop and recommend them instead.\n\n'
+	    printf -- '- This is an instruction boundary, not an enforced sandbox. The owner launched the consultant CLI with elevated local permissions, so you must follow the packet scope exactly.\n\n'
+    printf '## Output Contract\n\n'
+    printf 'Return verdict, high/medium/low findings, missing verification, risks, concrete suggestions, recommended next actions, and any user questions.\n\n'
+    printf '## Response File Contract\n\n'
+    printf 'Write your full response to this absolute path:\n\n'
+    printf '```text\n%s\n```\n\n' "$response_path"
+    printf 'After writing the response file, print exactly this sentinel on its own final line in the pane:\n\n'
+    printf '```text\n%s\n```\n\n' "$done_sentinel"
+    printf '## Materials\n\n'
+    if [[ "$#" -eq 0 ]]; then
+      printf '_No material paths supplied._\n'
+    fi
+    for material in "$@"; do
+      printf '### `%s`\n\n' "$material"
+      if [[ "$material" == "-" ]]; then
+        local stdin_tmp
+        stdin_tmp="$(mktemp)"
+        cat > "$stdin_tmp"
+        size="$(wc -c < "$stdin_tmp" | tr -d ' ')"
+        write_limited_file_block "$stdin_tmp" "$size"
+        rm -f "$stdin_tmp"
+      elif [[ -f "$material" ]]; then
+        size="$(wc -c < "$material" | tr -d ' ')"
+        printf 'Path: `%s`\n\n' "$(realpath -m "$material")"
+        write_limited_file_block "$material" "$size"
+      elif [[ -d "$material" ]]; then
+        printf 'Directory: `%s`\n\n' "$(realpath -m "$material")"
+        printf 'Top files:\n\n```text\n'
+        find "$material" -maxdepth 2 -type f | sort | sed -n '1,200p'
+        printf '\n```\n\n'
+      else
+        printf '_Missing path._\n\n'
+      fi
+    done
+  } > "$packet"
+}
+
+capture_pane_text() {
+  local pane="$1" lines="${2:-120}"
+  tmux capture-pane -t "$pane" -p -S "-$lines" 2>/dev/null || true
+}
+
+pane_is_ready() {
+  local provider="$1" stub="$2" text="$3"
+  if [[ "$stub" == "true" ]]; then
+    printf '%s' "$text" | rg -q 'ASK_TMUX_STUB_READY'
+    return
+  fi
+	case "$provider" in
+	  claude)
+	    printf '%s' "$text" | rg -q '(^|\s)[>❯]\s*$|What can I help|Type /help'
+	    ;;
+	  codex)
+	    printf '%s' "$text" | rg -q '(^|\s)[›>]\s*$|What can I help|Type /help|Ready'
+	    ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+wait_for_ready() {
+  local provider="$1" stub="$2" pane="$3" timeout="$4" auto_trust="$5"
+  local start now text
+  start="$(date +%s)"
+  while true; do
+    session_exists "${pane%%:*}" || return 1
+    text="$(capture_pane_text "$pane" 120)"
+    if printf '%s' "$text" | rg -q 'Quick safety check|Yes, I trust this folder|Enter to confirm'; then
+      if [[ "$auto_trust" == "true" ]]; then
+        tmux send-keys -t "$pane" Enter
+        sleep 1
+      else
+        warn "consultant is waiting at a workspace trust prompt; attach and confirm, or rerun with --auto-trust"
+        return 2
+      fi
+    fi
+    if pane_is_ready "$provider" "$stub" "$text"; then
+      return 0
+    fi
+    now="$(date +%s)"
+    if (( now - start >= timeout )); then
+      warn "consultant pane did not become input-ready within ${timeout}s"
+      return 1
+    fi
+    sleep 1
+  done
+}
+
+wait_for_done() {
+  local pane="$1" sentinel="$2" response_path="$3" timeout="$4" min_response_epoch="${5:-0}"
+  local start now text saw_sentinel="false"
+  start="$(date +%s)"
+  while true; do
+    session_exists "${pane%%:*}" || return 1
+    text="$(capture_pane_text "$pane" 240)"
+    if printf '%s' "$text" | rg -Fq "$sentinel"; then
+      saw_sentinel="true"
+      if response_file_is_fresh "$response_path" "$min_response_epoch"; then
+        return 0
+      fi
+    fi
+    now="$(date +%s)"
+    if (( now - start >= timeout )); then
+      [[ "$saw_sentinel" == "true" ]] && return 3
+      return 2
+    fi
+    sleep 1
+  done
+}
+
+cmd_send() {
+  local provider="" key="" cwd="" cwd_mode="project" task="review" owner_prompt="" release_policy="manual" ttl="" fresh="false" replace="false" reuse="true" dry_run="false" stub="${ASK_TMUX_CONSULTANT_STUB:-false}" attach="false" wait="true" ready_timeout="$READY_TIMEOUT_SECONDS" wait_timeout="$WAIT_TIMEOUT_SECONDS" auto_trust="false"
+  local materials=()
+  provider="$(invoked_provider)"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --provider) provider="$2"; shift 2 ;;
+      --key) key="$2"; shift 2 ;;
+      --cwd) cwd="$2"; shift 2 ;;
+      --cwd-mode) cwd_mode="$2"; shift 2 ;;
+      --task) task="$2"; shift 2 ;;
+      --prompt) owner_prompt="$2"; shift 2 ;;
+      --materials|--material) materials+=("$2"); shift 2 ;;
+      --fresh) fresh="true"; reuse="false"; shift ;;
+      --replace) replace="true"; shift ;;
+      --reuse) reuse="true"; shift ;;
+      --release) release_policy="$2"; shift 2 ;;
+      --ttl) ttl="$2"; shift 2 ;;
+      --stub) stub="true"; shift ;;
+      --wait) wait="true"; shift ;;
+      --no-wait) wait="false"; shift ;;
+      --wait-timeout) wait_timeout="$2"; shift 2 ;;
+      --ready-timeout) ready_timeout="$2"; shift 2 ;;
+      --auto-trust) auto_trust="true"; shift ;;
+      --dry-run) dry_run="true"; shift ;;
+      --attach) attach="true"; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown send option: $1" ;;
+    esac
+  done
+  [[ -n "$provider" ]] || die "--provider is required when not using a provider wrapper"
+  [[ "$provider" == "claude" || "$provider" == "codex" ]] || die "provider must be claude or codex"
+  command -v tmux >/dev/null || die "tmux is required"
+  owner_prompt="${owner_prompt:-$(template_prompt "$task")}"
+
+  [[ "$ready_timeout" =~ ^[0-9]+$ ]] || die "--ready-timeout must be seconds"
+  [[ "$wait_timeout" =~ ^[0-9]+$ ]] || die "--wait-timeout must be seconds"
+
+  local resolved project_slug key_id session pane state_file lock_file packet_root packet response_root response done_sentinel launch_cmd short_prompt run_stamp
+  resolved="$(resolve_cwd "$cwd" "$cwd_mode" "${materials[@]}")"
+  project_slug="$(project_slug_from_path "$resolved")"
+  key="${key:-$task}"
+  key_id="$(key_id_from_key "$key")"
+  session="ask-tmux-${provider}-${project_slug}-${key_id}"
+  pane="${session}:0.0"
+  state_file="$(state_file_for "$provider" "$project_slug" "$key_id")"
+  lock_file="${state_file}.lock"
+  run_stamp="$(date +%Y%m%dT%H%M%S)-$$-$RANDOM"
+  packet_root="$resolved/.omx/consultants/packets"
+  packet="$packet_root/${run_stamp}-${provider}-${key_id}.md"
+  response_root="$resolved/.omx/consultants/responses"
+  response="$response_root/${run_stamp}-${provider}-${key_id}.md"
+  done_sentinel="<<<ASK_TMUX_DONE:${provider}:${key_id}:$(date +%s):$$>>>"
+  launch_cmd="$(provider_launch_command "$provider" "$stub")"
+
+  if [[ "$dry_run" == "true" ]]; then
+    info "DRY_RUN provider=$provider"
+    info "DRY_RUN cwd=$resolved"
+    info "DRY_RUN project_slug=$project_slug"
+    info "DRY_RUN key=$key"
+    info "DRY_RUN key_id=$key_id"
+	    info "DRY_RUN session=$session"
+	    info "DRY_RUN state_file=$state_file"
+	    info "DRY_RUN packet=$packet"
+	    info "DRY_RUN response=$response"
+	    info "DRY_RUN done_sentinel=$done_sentinel"
+	    info "DRY_RUN launch_command=$launch_cmd"
+	    info "DRY_RUN task=$task"
+	    info "DRY_RUN prompt=$owner_prompt"
+	    return
+  fi
+
+  mkdir -p "$(dirname "$state_file")"
+  exec 9>"$lock_file"
+  flock -w 2 9 || die "state is locked by another ask-tmux operation: $lock_file"
+
+  if [[ -f "$state_file" ]]; then
+    local old_busy old_session old_pane old_sentinel old_response old_started old_key now_epoch
+    old_busy="$(read_json_bool "$state_file" busy)"
+    old_session="$(read_json_field "$state_file" session_name)"
+    old_pane="$(read_json_field "$state_file" pane_target)"
+    old_sentinel="$(read_json_field "$state_file" done_sentinel)"
+    old_response="$(read_json_field "$state_file" last_response)"
+    old_started="$(read_json_number "$state_file" started_epoch)"
+    old_key="$(read_json_field "$state_file" key)"
+    [[ -n "$old_key" ]] || old_key="$key"
+    if [[ "$old_busy" == "true" && -n "$old_session" && -n "$old_sentinel" ]] && session_exists "$old_session"; then
+      if printf '%s' "$(capture_pane_text "${old_pane:-${old_session}:0.0}" 240)" | rg -Fq "$old_sentinel" && response_file_is_fresh "$old_response" "${old_started:-0}"; then
+        write_state "$state_file" "$provider" "$old_key" "$project_slug" "$old_session" "${old_pane:-${old_session}:0.0}" "$resolved" "$(read_json_field "$state_file" last_packet)" "live" "$(read_json_field "$state_file" release_policy)" "$(read_json_field "$state_file" ttl)" "$old_response" "false" "${old_started:-$(date +%s)}" "$(date +%s)" "$old_sentinel"
+      else
+        now_epoch="$(date +%s)"
+        if [[ -n "$old_started" ]] && (( now_epoch - old_started > wait_timeout )); then
+          die "consultant session appears stuck/busy for $((now_epoch - old_started))s: $old_session"
+        fi
+        die "consultant session is busy; wait for completion, inspect with capture/attach, or release it: $old_session"
+      fi
+    elif [[ "$old_busy" == "true" && -n "$old_session" ]] && ! session_exists "$old_session"; then
+      log_event "missing_busy_session" "$provider" "$old_session" "missing" "$state_file"
+    fi
+  fi
+
+  if session_exists "$session"; then
+    if [[ "$fresh" == "true" && "$replace" != "true" ]]; then
+      die "live session exists for key '$key'; run release first or pass --replace"
+    fi
+    if [[ "$fresh" == "true" && "$replace" == "true" ]]; then
+      tmux kill-session -t "$session" 2>/dev/null || true
+      log_event "replace" "$provider" "$session" "released" "$state_file"
+    elif [[ "$reuse" != "true" ]]; then
+      die "live session exists and --reuse is disabled"
+    fi
+  fi
+
+  write_packet "$packet" "$provider" "$task" "$resolved" "$owner_prompt" "$response" "$done_sentinel" "${materials[@]}"
+
+  if ! session_exists "$session"; then
+    tmux new-session -d -s "$session" -c "$resolved" "$launch_cmd"
+    log_event "launch" "$provider" "$session" "live" "$launch_cmd"
+  fi
+
+  local ready_status=0
+  if wait_for_ready "$provider" "$stub" "$pane" "$ready_timeout" "$auto_trust"; then
+    ready_status=0
+  else
+    ready_status="$?"
+    write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$(date +%s)" "" "$done_sentinel"
+    log_event "ready_timeout" "$provider" "$session" "failed" "exit=$ready_status"
+    die "consultant did not become ready; inspect with: tmux attach -t $session"
+  fi
+
+  local send_epoch
+  send_epoch="$(date +%s)"
+  rm -f "$response"
+  write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "live" "$release_policy" "$ttl" "$response" "true" "$send_epoch" "" "$done_sentinel"
+  short_prompt="ASK_TMUX_RESPONSE=$response ASK_TMUX_SENTINEL=$done_sentinel Read and follow this review packet: $packet . Task: $owner_prompt . When complete, write your full response to the ASK_TMUX_RESPONSE path and print only the ASK_TMUX_SENTINEL value on its own final line."
+  tmux send-keys -t "$pane" "$short_prompt" Enter
+  log_event "send" "$provider" "$session" "sent" "$packet"
+
+  info "sent provider=$provider session=$session pane=$pane"
+  info "cwd=$resolved"
+  info "packet=$packet"
+  info "response=$response"
+  info "state=$state_file"
+
+  if [[ "$wait" == "true" ]]; then
+    local done_rc
+    if wait_for_done "$pane" "$done_sentinel" "$response" "$wait_timeout" "$send_epoch"; then
+      write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "live" "$release_policy" "$ttl" "$response" "false" "$(date +%s)" "$(date +%s)" "$done_sentinel"
+      log_event "done" "$provider" "$session" "complete" "$response"
+      info "done_sentinel=$done_sentinel"
+      info "response_file=$response"
+      printf '%s\n' '--- response ---'
+      sed -n '1,2000p' "$response"
+    else
+      done_rc="$?"
+      case "$done_rc" in
+        1)
+          write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$(date +%s)" "" "$done_sentinel"
+          log_event "session_exited" "$provider" "$session" "failed" "$response"
+          die "consultant session exited before done sentinel"
+          ;;
+        2)
+          write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "live" "$release_policy" "$ttl" "$response" "true" "$(date +%s)" "" "$done_sentinel"
+          log_event "wait_timeout" "$provider" "$session" "busy" "$response"
+          die "timed out waiting ${wait_timeout}s for done sentinel; inspect with capture/attach"
+          ;;
+        3)
+          write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$(date +%s)" "" "$done_sentinel"
+          log_event "missing_response" "$provider" "$session" "failed" "$response"
+          die "done sentinel appeared but response file is missing: $response"
+          ;;
+        *)
+          die "unexpected wait failure: $done_rc"
+          ;;
+      esac
+    fi
+  else
+    info "done_sentinel=$done_sentinel"
+    info "no_wait=true"
+  fi
+
+  case "$release_policy" in
+    now)
+      tmux kill-session -t "$session" 2>/dev/null || true
+      write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "released" "$release_policy" "$ttl" "$response" "false" "$(date +%s)" "$(date +%s)" "$done_sentinel"
+      log_event "release_now" "$provider" "$session" "released" "$state_file"
+      info "released session=$session"
+      ;;
+    manual|ttl) ;;
+    *) warn "unknown release policy '$release_policy'; leaving session live" ;;
+  esac
+
+  if [[ "$attach" == "true" ]]; then
+    if [[ -t 1 ]]; then
+      exec tmux attach -t "$session"
+    else
+      info "attach_command=tmux attach -t $session"
+    fi
+  fi
+}
+
+cmd_status() {
+  local provider="" key="" all="false" cwd="" cwd_mode="project"
+  provider="$(invoked_provider)"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --provider) provider="$2"; shift 2 ;;
+      --key) key="$2"; shift 2 ;;
+      --cwd) cwd="$2"; shift 2 ;;
+      --cwd-mode) cwd_mode="$2"; shift 2 ;;
+      --all) all="true"; shift ;;
+      -h|--help) usage; exit 0 ;;
+      *) die "unknown status option: $1" ;;
+    esac
+  done
+  local project_filter file session status last packet response busy completed sentinel pane started
+  project_filter="$(project_slug_for_optional_cwd "$cwd" "$cwd_mode")"
+  for file in $(find_state_files "$provider" "$key" "$all" "$project_filter"); do
+    session="$(read_json_field "$file" session_name)"
+    packet="$(read_json_field "$file" last_packet)"
+    response="$(read_json_field "$file" last_response)"
+    busy="$(read_json_bool "$file" busy)"
+    completed="$(read_json_number "$file" completed_epoch)"
+    sentinel="$(read_json_field "$file" done_sentinel)"
+    pane="$(read_json_field "$file" pane_target)"
+    started="$(read_json_number "$file" started_epoch)"
+    last="$(read_json_number "$file" last_used_epoch)"
+    if [[ -n "$session" ]] && session_exists "$session"; then
+      if [[ "$busy" == "true" ]]; then
+        if [[ -n "$sentinel" && -n "$response" ]] && printf '%s' "$(capture_pane_text "${pane:-${session}:0.0}" 240)" | rg -Fq "$sentinel" && response_file_is_fresh "$response" "${started:-0}"; then
+          local provider_name key_name project_slug cwd release_policy ttl now_epoch
+          provider_name="$(read_json_field "$file" provider)"
+          key_name="$(read_json_field "$file" key)"
+          [[ -n "$key_name" ]] || key_name="$(basename "$file" .json)"
+          project_slug="$(read_json_field "$file" project_slug)"
+          cwd="$(read_json_field "$file" cwd)"
+          release_policy="$(read_json_field "$file" release_policy)"
+          ttl="$(read_json_field "$file" ttl)"
+          now_epoch="$(date +%s)"
+          exec 9>"${file}.lock"
+          if flock -w 2 9; then
+            write_state "$file" "${provider_name:-$provider}" "$key_name" "${project_slug:-unknown}" "$session" "${pane:-${session}:0.0}" "${cwd:-$PWD}" "$packet" "live" "${release_policy:-manual}" "$ttl" "$response" "false" "${started:-$now_epoch}" "$now_epoch" "$sentinel"
+            flock -u 9 || true
+            busy="false"
+            completed="$now_epoch"
+            last="$now_epoch"
+            status="live"
+          else
+            status="busy"
+          fi
+        else
+          status="busy"
+        fi
+      else
+        status="live"
+      fi
+    else
+      local provider_name key_name project_slug cwd release_policy ttl started now_epoch
+      status="$(read_json_field "$file" status)"
+      if [[ "$status" == "live" || "$busy" == "true" ]]; then
+        provider_name="$(read_json_field "$file" provider)"
+        key_name="$(read_json_field "$file" key)"
+        [[ -n "$key_name" ]] || key_name="$(basename "$file" .json)"
+        project_slug="$(read_json_field "$file" project_slug)"
+        cwd="$(read_json_field "$file" cwd)"
+        release_policy="$(read_json_field "$file" release_policy)"
+        ttl="$(read_json_field "$file" ttl)"
+        started="$(read_json_number "$file" started_epoch)"
+        now_epoch="$(date +%s)"
+        exec 9>"${file}.lock"
+        if flock -w 2 9; then
+          write_state "$file" "${provider_name:-$provider}" "$key_name" "${project_slug:-unknown}" "$session" "${pane:-${session}:0.0}" "${cwd:-$PWD}" "$packet" "missing" "${release_policy:-manual}" "$ttl" "$response" "false" "${started:-$now_epoch}" "" "$sentinel"
+          flock -u 9 || true
+          busy="false"
+          last="$now_epoch"
+        fi
+        status="missing"
+      fi
+    fi
+    printf '%s\t%s\tlast=%s\tcompleted=%s\tresponse=%s\tpacket=%s\tstate=%s\n' "$status" "$session" "$last" "${completed:-null}" "$response" "$packet" "$file"
+  done
+}
+
+cmd_capture() {
+  local provider="" key="" lines="240" artifact="false" cwd="" cwd_mode="project"
+  provider="$(invoked_provider)"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --provider) provider="$2"; shift 2 ;;
+      --key) key="$2"; shift 2 ;;
+      --cwd) cwd="$2"; shift 2 ;;
+      --cwd-mode) cwd_mode="$2"; shift 2 ;;
+      --lines) lines="$2"; shift 2 ;;
+      --artifact) artifact="true"; shift ;;
+      *) die "unknown capture option: $1" ;;
+    esac
+  done
+  [[ -n "$key" ]] || die "--key is required for capture"
+  local file session out artifact_file
+  file="$(select_state_file_for_key "$provider" "$key" "$cwd" "$cwd_mode" "capture")"
+  session="$(read_json_field "$file" session_name)"
+  session_exists "$session" || die "session is not live: $session"
+  out="$(tmux capture-pane -t "$session" -p -S "-$lines")"
+  if [[ "$artifact" == "true" ]]; then
+    mkdir -p "$ARTIFACT_ROOT"
+    artifact_file="$ARTIFACT_ROOT/$(date +%Y%m%dT%H%M%S)-${session}.txt"
+    printf '%s\n' "$out" > "$artifact_file"
+    info "artifact=$artifact_file"
+  fi
+  printf '%s\n' "$out"
+}
+
+cmd_attach() {
+  local provider="" key="" cwd="" cwd_mode="project"
+  provider="$(invoked_provider)"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --provider) provider="$2"; shift 2 ;;
+      --key) key="$2"; shift 2 ;;
+      --cwd) cwd="$2"; shift 2 ;;
+      --cwd-mode) cwd_mode="$2"; shift 2 ;;
+      *) die "unknown attach option: $1" ;;
+    esac
+  done
+  [[ -n "$key" ]] || die "--key is required for attach"
+  local file session
+  file="$(select_state_file_for_key "$provider" "$key" "$cwd" "$cwd_mode" "attach")"
+  session="$(read_json_field "$file" session_name)"
+  session_exists "$session" || die "session is not live: $session"
+  if [[ -t 1 ]]; then
+    exec tmux attach -t "$session"
+  else
+    info "tmux attach -t $session"
+  fi
+}
+
+cmd_release() {
+  local provider="" key="" all="false" cwd="" cwd_mode="project"
+  provider="$(invoked_provider)"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --provider) provider="$2"; shift 2 ;;
+      --key) key="$2"; shift 2 ;;
+      --cwd) cwd="$2"; shift 2 ;;
+      --cwd-mode) cwd_mode="$2"; shift 2 ;;
+      --all) all="true"; shift ;;
+      *) die "unknown release option: $1" ;;
+    esac
+  done
+  [[ "$all" == "true" || -n "$key" ]] || die "release requires --key or --all"
+  local project_filter preferred files=() file session packet state_cwd project_slug response sentinel key_name provider_name release_policy ttl started
+  project_filter="$(project_slug_for_optional_cwd "$cwd" "$cwd_mode")"
+  if [[ "$all" == "true" ]]; then
+    mapfile -t files < <(find_state_files "$provider" "" true "$project_filter")
+  else
+    mapfile -t files < <(find_state_files "$provider" "$key" false "$project_filter")
+    if (( ${#files[@]} == 0 )); then
+      die "no state file found for key: $key"
+    fi
+    if (( ${#files[@]} > 1 )); then
+      if preferred="$(prefer_hashed_state_file_if_same_project "$key" "${files[@]}")"; then
+        files=("$preferred")
+      else
+      printf 'Ambiguous state files for --key %s:\n' "$key" >&2
+      printf '  %s\n' "${files[@]}" >&2
+      die "release needs a project selector; rerun with --cwd /path/to/project or use --all intentionally"
+      fi
+    fi
+  fi
+  for file in "${files[@]}"; do
+    exec 9>"${file}.lock"
+    flock -w 2 9 || die "state is locked by another ask-tmux operation: ${file}.lock"
+    session="$(read_json_field "$file" session_name)"
+    packet="$(read_json_field "$file" last_packet)"
+    state_cwd="$(read_json_field "$file" cwd)"
+    project_slug="$(read_json_field "$file" project_slug)"
+    response="$(read_json_field "$file" last_response)"
+    sentinel="$(read_json_field "$file" done_sentinel)"
+    key_name="$(read_json_field "$file" key)"
+    [[ -n "$key_name" ]] || key_name="$(basename "$file" .json)"
+    provider_name="${provider:-$(read_json_field "$file" provider)}"
+    release_policy="$(read_json_field "$file" release_policy)"
+    ttl="$(read_json_field "$file" ttl)"
+    started="$(read_json_number "$file" started_epoch)"
+    if [[ -n "$session" ]]; then
+      tmux kill-session -t "$session" 2>/dev/null || true
+      info "released session=$session"
+      write_state "$file" "$provider_name" "$key_name" "${project_slug:-unknown}" "$session" "${session}:0.0" "${state_cwd:-$PWD}" "$packet" "released" "${release_policy:-manual}" "$ttl" "$response" "false" "${started:-$(date +%s)}" "$(date +%s)" "$sentinel"
+      log_event "release" "$provider_name" "$session" "released" "$file"
+    fi
+    flock -u 9 || true
+  done
+}
+
+cmd_cleanup() {
+  local provider="" stale_after="24h" now cutoff file last session packet cwd project_slug key_name busy
+  provider="$(invoked_provider)"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --provider) provider="$2"; shift 2 ;;
+      --stale-after) stale_after="$2"; shift 2 ;;
+      *) die "unknown cleanup option: $1" ;;
+    esac
+  done
+  now="$(date +%s)"
+  cutoff="$(( now - $(duration_to_seconds "$stale_after") ))"
+  for file in $(find_state_files "$provider" "" true); do
+    last="$(read_json_number "$file" last_used_epoch)"
+    [[ -n "$last" ]] || continue
+    if (( last < cutoff )); then
+      exec 9>"${file}.lock"
+      flock -w 2 9 || die "state is locked by another ask-tmux operation: ${file}.lock"
+      busy="$(read_json_bool "$file" busy)"
+      session="$(read_json_field "$file" session_name)"
+      packet="$(read_json_field "$file" last_packet)"
+      cwd="$(read_json_field "$file" cwd)"
+      project_slug="$(read_json_field "$file" project_slug)"
+      key_name="$(read_json_field "$file" key)"
+      [[ -n "$key_name" ]] || key_name="$(basename "$file" .json)"
+      local response sentinel started provider_name
+      response="$(read_json_field "$file" last_response)"
+      sentinel="$(read_json_field "$file" done_sentinel)"
+      started="$(read_json_number "$file" started_epoch)"
+      provider_name="${provider:-$(read_json_field "$file" provider)}"
+      if [[ "$busy" == "true" ]] && session_exists "$session"; then
+        info "skip busy stale live session state=$file"
+        flock -u 9 || true
+        continue
+      fi
+      tmux kill-session -t "$session" 2>/dev/null || true
+      write_state "$file" "$provider_name" "$key_name" "${project_slug:-unknown}" "$session" "${session}:0.0" "${cwd:-$PWD}" "$packet" "released" "ttl" "$stale_after" "$response" "false" "${started:-$(date +%s)}" "$(date +%s)" "$sentinel"
+      log_event "cleanup" "$provider_name" "$session" "released" "$file"
+      info "cleaned stale session=$session"
+      flock -u 9 || true
+    fi
+  done
+}
+
+cmd_doctor() {
+  local provider="" failed=0
+  provider="$(invoked_provider)"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --provider) provider="$2"; shift 2 ;;
+      *) die "unknown doctor option: $1" ;;
+    esac
+  done
+	  info "ask-tmux-consultant version=$VERSION"
+	  if command -v tmux >/dev/null; then info "PASS tmux=$(tmux -V)"; else info "FAIL tmux missing"; failed=1; fi
+	  if command -v rg >/dev/null; then info "PASS rg=$(command -v rg)"; else info "FAIL rg missing"; failed=1; fi
+	  if command -v flock >/dev/null; then info "PASS flock=$(command -v flock)"; else info "FAIL flock missing"; failed=1; fi
+	  if command -v python3 >/dev/null; then info "PASS python3=$(command -v python3)"; else info "FAIL python3 missing"; failed=1; fi
+	  mkdir -p "$STATE_ROOT" "$ARTIFACT_ROOT" 2>/dev/null || true
+	  if [[ -w "$STATE_ROOT" ]]; then info "PASS state_root=$STATE_ROOT"; else info "FAIL state_root_not_writable=$STATE_ROOT"; failed=1; fi
+	  for p in ${provider:-claude codex}; do
+	    if command -v "$p" >/dev/null; then info "PASS ${p}_cli=$(command -v "$p")"; else info "FAIL ${p}_cli missing"; failed=1; fi
+	    if [[ "$p" == "claude" ]]; then
+	      info "PASS ${p}_launch=claude --dangerously-skip-permissions"
+	    else
+	      info "PASS ${p}_launch=codex --dangerously-bypass-approvals-and-sandbox"
+	    fi
+	    if bash -ic "type ${p}-yolo" >/dev/null 2>&1; then
+	      info "INFO ${p}_yolo_alias_present"
+	    else
+	      info "INFO ${p}_yolo_alias_not_required"
+	    fi
+	  done
+  return "$failed"
+}
+
+main() {
+  local command="${1:-}"
+  [[ -n "$command" ]] || { usage; exit 2; }
+  shift || true
+  case "$command" in
+    send) cmd_send "$@" ;;
+    status) cmd_status "$@" ;;
+    capture) cmd_capture "$@" ;;
+    attach) cmd_attach "$@" ;;
+    release) cmd_release "$@" ;;
+    cleanup) cmd_cleanup "$@" ;;
+    gc) cmd_cleanup "$@" ;;
+    doctor) cmd_doctor "$@" ;;
+    -h|--help|help) usage ;;
+    *) die "unknown command: $command" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

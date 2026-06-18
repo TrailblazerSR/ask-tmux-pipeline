@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+target="$script_dir/ask-tmux-claude-pipeline"
+if [[ ! -x "$target" ]]; then
+  target="$(command -v ask-tmux-claude-pipeline 2>/dev/null || printf '/home/h3031/bin/ask-tmux-claude-pipeline')"
+fi
+
+exec "$target" "$@"

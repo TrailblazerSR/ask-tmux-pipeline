@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+runner="$script_dir/ask-tmux-pipeline"
+if [[ ! -x "$runner" ]]; then
+  runner="$(command -v ask-tmux-pipeline 2>/dev/null || printf '/home/h3031/bin/ask-tmux-pipeline')"
+fi
+
+cmd="${1:-}"
+if [[ -z "$cmd" ]]; then
+  exec "$runner" --help
+fi
+
+case "$cmd" in
+  start)
+    shift || true
+    exec "$runner" "$cmd" --provider codex --mode mirror "$@"
+    ;;
+  answer|review|status|resume|final-context|doctor|-h|--help|help)
+    shift || true
+    exec "$runner" "$cmd" --provider codex "$@"
+    ;;
+  --*)
+    exec "$runner" start --provider codex --mode mirror "$@"
+    ;;
+  *)
+    exec "$runner" start --provider codex --mode mirror "$@"
+    ;;
+esac
