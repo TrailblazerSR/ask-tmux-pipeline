@@ -218,4 +218,4 @@ The smoke test uses `--stub`, so it does not call live Claude or Codex.
 
 ## License
 
-No license has been selected yet.
+MIT License. See [LICENSE](LICENSE).
