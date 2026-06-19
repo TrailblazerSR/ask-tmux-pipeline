@@ -1,6 +1,13 @@
 ---
 name: ask-tmux-claude-pipeline
-description: Pipeline the current owner prompt through a reusable tmux Claude session, relay Claude clarification questions back to the current CLI/user, optionally send the current CLI draft back to Claude for review, and synthesize Claude work into the final answer. Use when the user asks for ask-tmux-claude-pipeline, ask-tmux-claude-pure, same prompt to tmux Claude, Claude pipeline, Claude pure mirror, tmux Claude clarification relay, or Claude review of the current CLI answer.
+description: >-
+  Pipeline the current owner prompt through a reusable tmux Claude session,
+  relay Claude clarification questions back to the current CLI/user, optionally
+  send the current CLI draft back to Claude for review, and synthesize Claude
+  work into the final answer. Use for ask-tmux-claude-pipeline,
+  ask-tmux-claude-pure, same prompt to tmux Claude, Claude pipeline, Claude pure
+  mirror, tmux Claude clarification relay, or Claude review of the current CLI
+  answer.
 ---
 
 # Ask Tmux Claude Pipeline

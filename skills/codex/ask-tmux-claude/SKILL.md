@@ -1,6 +1,12 @@
 ---
 name: ask-tmux-claude
-description: Launch or reuse a Claude tmux consultant session for review, comments, suggestions, planning critique, design discussion, or external Claude second opinion. Use when the user says ask Claude, ask a Claude, ask Claude in tmux, ask-tmux-claude, ask-tux-claude, external Claude reviewer, consultant Claude session, Claude reviewer, Claude consultant, Claude review/comment/suggest, review comment and suggest, have Claude review Codex's session/work, review this session with Claude, or repeated Claude consultation should preserve context.
+description: >-
+  Launch or reuse a Claude tmux consultant session for review, comments,
+  suggestions, planning critique, design discussion, or external Claude second
+  opinion. Use when the user says ask Claude, ask Claude in tmux,
+  ask-tmux-claude, ask-tux-claude, external Claude reviewer, Claude consultant,
+  Claude review/comment/suggest, have Claude review Codex's session/work, or
+  repeated Claude consultation should preserve context.
 ---
 
 # Ask Tmux Claude

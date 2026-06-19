@@ -1,6 +1,12 @@
 ---
 name: ask-tmux-codex
-description: Launch or reuse a Codex tmux consultant session for fresh-context review, comments, suggestions, planning critique, design discussion, verification, or second-opinion Codex analysis. Use when the user or Claude says ask Codex, ask Codex in tmux, ask-tmux-codex, external Codex reviewer, consultant Codex session, Codex reviewer, Codex consultant, have another Codex review/comment/suggest, review comment and suggest, inspect a session/work summary, or repeated Codex consultation should preserve context.
+description: >-
+  Launch or reuse a Codex tmux consultant session for fresh-context review,
+  comments, suggestions, planning critique, design discussion, verification, or
+  second-opinion Codex analysis. Use when the user or Claude says ask Codex,
+  ask Codex in tmux, ask-tmux-codex, external Codex reviewer, Codex consultant,
+  Codex review/comment/suggest, inspect a session/work summary, or repeated
+  Codex consultation should preserve context.
 ---
 
 # Ask Tmux Codex

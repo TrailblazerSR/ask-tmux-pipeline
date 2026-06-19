@@ -1,6 +1,12 @@
 ---
 name: ask-tmux-codex-pipeline
-description: Pipeline the current owner prompt through a reusable tmux Codex session, relay Codex clarification questions back to the current CLI/user, optionally send the current CLI draft back to Codex for review, and synthesize Codex work into the final answer. Use when the user asks for ask-tmux-codex-pipeline, ask-tmux-codex-pure, same prompt to tmux Codex, Codex pipeline, Codex pure mirror, tmux Codex clarification relay, or Codex review of the current CLI answer.
+description: >-
+  Pipeline the current owner prompt through a reusable tmux Codex session,
+  relay Codex clarification questions back to the current CLI/user, optionally
+  send the current CLI draft back to Codex for review, and synthesize Codex work
+  into the final answer. Use for ask-tmux-codex-pipeline, ask-tmux-codex-pure,
+  same prompt to tmux Codex, Codex pipeline, Codex pure mirror, tmux Codex
+  clarification relay, or Codex review of the current CLI answer.
 ---
 
 # Ask Tmux Codex Pipeline
