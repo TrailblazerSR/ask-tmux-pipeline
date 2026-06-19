@@ -93,7 +93,7 @@ For more examples, see [docs/command-selection-guide.md](docs/command-selection-
 
 ## Flowcharts
 
-The diagrams use short labels to render cleanly on GitHub. Exact command forms are shown in the quick guide above and the command-selection guide.
+The diagrams use compact labels and explicit Mermaid Markdown line wrapping to render cleanly on GitHub. Exact command forms are shown in the quick guide above and the command-selection guide.
 
 ### Overall Command Choice
 
@@ -102,13 +102,14 @@ flowchart TD
     accTitle: Overall Command Choice
     accDescr: Command selection flow showing whether to review existing material, mirror a prompt, answer a clarification, review a draft, or recover pipeline state
 
-    choose_task{Choose task}
-    choose_task -->|Existing files| send_command[Use send]
-    choose_task -->|Same prompt| start_command[Use start]
-    choose_task -->|Other final| pure_alias[Use pure]
-    choose_task -->|Clarify| answer_command[Use answer]
-    choose_task -->|Critique| review_command[Use review]
-    choose_task -->|Recover| inspect_command[Status or resume]
+    choose_task{"`Choose
+    task`"}
+    choose_task -->|Files| send_command["`send`"]
+    choose_task -->|Prompt| start_command["`start`"]
+    choose_task -->|Mirror| pure_alias["`pure`"]
+    choose_task -->|Question| answer_command["`answer`"]
+    choose_task -->|Draft| review_command["`review`"]
+    choose_task -->|State| inspect_command["`inspect`"]
 ```
 
 ### Review Existing Material
@@ -120,11 +121,15 @@ flowchart TD
     accTitle: Review Existing Material
     accDescr: Review flow for sending existing files or artifacts to a reusable tmux Claude or Codex consultant session
 
-    existing_material[Existing material] --> choose_reviewer{Choose reviewer}
-    choose_reviewer --> send_packet[Run send]
-    send_packet --> tmux_review[Tmux review]
-    tmux_review --> response_file[Response file]
-    response_file --> owner_apply[Owner applies]
+    existing_material["`Existing
+    files`"] --> choose_reviewer{"`Choose
+    reviewer`"}
+    choose_reviewer --> send_packet["`send`"]
+    send_packet --> tmux_review["`tmux
+    review`"]
+    tmux_review --> response_file["`response
+    file`"]
+    response_file --> owner_apply["`apply`"]
 ```
 
 ### Same Prompt With Owner Synthesis
@@ -136,17 +141,24 @@ flowchart TD
     accTitle: Same Prompt Synthesis
     accDescr: Same-prompt flow where the owner CLI and a tmux CLI work in parallel, then the owner synthesizes the final answer
 
-    owner_prompt[Owner prompt] --> start_pipeline[Run start]
-    start_pipeline --> tmux_work[Tmux work]
-    start_pipeline --> owner_work[Owner work]
+    owner_prompt["`Owner
+    prompt`"] --> start_pipeline["`start`"]
+    start_pipeline --> tmux_work["`tmux
+    work`"]
+    start_pipeline --> owner_work["`owner
+    work`"]
     tmux_work --> status_check{Status}
-    status_check -->|Ready| read_context[Read context]
-    status_check -->|Question| ask_user[Ask user]
-    status_check -->|Blocked| report_blocker[Report blocker]
-    ask_user --> send_answer[Run answer]
+    status_check -->|Ready| read_context["`read
+    context`"]
+    status_check -->|Question| ask_user["`ask
+    user`"]
+    status_check -->|Blocked| report_blocker["`report
+    blocker`"]
+    ask_user --> send_answer["`answer`"]
     send_answer --> status_check
     owner_work --> read_context
-    read_context --> final_answer[Final answer]
+    read_context --> final_answer["`final
+    answer`"]
 ```
 
 ### Pure / Mirror Mode
@@ -158,12 +170,17 @@ flowchart TD
     accTitle: Pure Mirror Mode
     accDescr: Pure mode flow where the owner CLI mainly relays the tmux Claude or Codex answer, with clarification and blocker paths
 
-    prompt_x[Prompt X] --> pure_command[Run pure]
-    pure_command --> tmux_answer[Tmux answer]
+    prompt_x["`Prompt
+    X`"] --> pure_command["`pure`"]
+    pure_command --> tmux_answer["`tmux
+    answer`"]
     tmux_answer --> status_check{Status}
-    status_check -->|Ready| relay_answer[Relay answer]
-    status_check -->|Question| answer_user[Answer user]
-    status_check -->|Blocked| report_blocker[Report blocker]
+    status_check -->|Ready| relay_answer["`relay
+    answer`"]
+    status_check -->|Question| answer_user["`answer
+    user`"]
+    status_check -->|Blocked| report_blocker["`report
+    blocker`"]
 ```
 
 ### Clarification Relay
@@ -175,13 +192,18 @@ flowchart TD
     accTitle: Clarification Relay
     accDescr: Clarification flow for relaying a tmux CLI question to the user and sending the answer back into the same pipeline
 
-    tmux_question[Tmux question] --> ask_owner[Ask user]
-    ask_owner --> user_answer[User answer]
-    user_answer --> run_answer[Run answer]
+    tmux_question["`tmux
+    question`"] --> ask_owner["`ask
+    user`"]
+    ask_owner --> user_answer["`user
+    answer`"]
+    user_answer --> run_answer["`answer`"]
     run_answer --> next_status{Status}
-    next_status -->|Ready| read_context[Read context]
+    next_status -->|Ready| read_context["`read
+    context`"]
     next_status -->|Question| ask_owner
-    next_status -->|Blocked| report_blocker[Report blocker]
+    next_status -->|Blocked| report_blocker["`report
+    blocker`"]
 ```
 
 ### Draft Review Before Final Answer
@@ -193,11 +215,16 @@ flowchart TD
     accTitle: Draft Review Flow
     accDescr: Draft review flow where the owner CLI asks tmux Claude or Codex to critique a draft before the final answer is sent
 
-    ready_context[Ready context] --> owner_draft[Owner draft]
-    owner_draft --> run_review[Run review]
-    run_review --> tmux_critique[Tmux critique]
-    tmux_critique --> update_context[Update context]
-    update_context --> send_final[Send final]
+    ready_context["`ready
+    context`"] --> owner_draft["`owner
+    draft`"]
+    owner_draft --> run_review["`review`"]
+    run_review --> tmux_critique["`tmux
+    critique`"]
+    tmux_critique --> update_context["`update
+    context`"]
+    update_context --> send_final["`send
+    final`"]
 ```
 
 ### Recovery And Inspection
@@ -210,14 +237,17 @@ flowchart TD
     accDescr: Recovery flow for locating a pipeline ID, checking status, and choosing whether to fetch context, answer a question, inspect a blocker, or resume
 
     have_id{Have ID?}
-    have_id -->|Yes| run_status[Run status]
-    have_id -->|No| find_id[Find ID]
+    have_id -->|Yes| run_status["`status`"]
+    have_id -->|No| find_id["`find
+    ID`"]
     find_id --> run_status
     run_status --> status_check{Status}
-    status_check -->|Ready| final_context[Final context]
-    status_check -->|Question| run_answer[Run answer]
-    status_check -->|Blocked| inspect_blocker[Inspect blocker]
-    status_check -->|Unclear| run_resume[Run resume]
+    status_check -->|Ready| final_context["`final
+    context`"]
+    status_check -->|Question| run_answer["`answer`"]
+    status_check -->|Blocked| inspect_blocker["`inspect
+    blocker`"]
+    status_check -->|Unclear| run_resume["`resume`"]
 ```
 
 ## Validation
