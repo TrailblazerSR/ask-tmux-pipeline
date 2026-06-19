@@ -212,6 +212,10 @@ The smoke test uses `--stub`, so it does not call live Claude or Codex.
 - Treat `~/.omx/state/tmux-pipelines/current.json` as advisory only.
 - Do not send secrets, credentials, cookies, or personal login material.
 
+## Friend Links
+
+- [linux.do](https://linux.do) - learn AI @ linux.do
+
 ## License
 
 No license has been selected yet.
