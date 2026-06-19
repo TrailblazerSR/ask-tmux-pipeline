@@ -93,17 +93,22 @@ For more examples, see [docs/command-selection-guide.md](docs/command-selection-
 
 ## Flowcharts
 
+The diagrams use short labels to render cleanly on GitHub. Exact command forms are shown in the quick guide above and the command-selection guide.
+
 ### Overall Command Choice
 
 ```mermaid
 flowchart TD
-  A{What situation are you in?}
-  A -->|Review existing files, plans, diffs, or summaries| B[ask-tmux-claude send<br/>ask-tmux-codex send]
-  A -->|Send the same prompt to another CLI and synthesize locally| C[ask-tmux-claude-pipeline start<br/>ask-tmux-codex-pipeline start]
-  A -->|Mostly use the other CLI's answer| D[ask-tmux-claude-pure<br/>ask-tmux-codex-pure]
-  A -->|The tmux CLI asked a user question| E[ask-tmux-*-pipeline answer]
-  A -->|Ask tmux CLI to review your draft| F[ask-tmux-*-pipeline review]
-  A -->|Inspect or recover a previous pipeline| G[status<br/>resume<br/>final-context]
+    accTitle: Overall Command Choice
+    accDescr: Command selection flow showing whether to review existing material, mirror a prompt, answer a clarification, review a draft, or recover pipeline state
+
+    choose_task{Choose task}
+    choose_task -->|Existing files| send_command[Use send]
+    choose_task -->|Same prompt| start_command[Use start]
+    choose_task -->|Other final| pure_alias[Use pure]
+    choose_task -->|Clarify| answer_command[Use answer]
+    choose_task -->|Critique| review_command[Use review]
+    choose_task -->|Recover| inspect_command[Status or resume]
 ```
 
 ### Review Existing Material
@@ -112,11 +117,14 @@ Use this when the input is already in files or artifacts and you want review/com
 
 ```mermaid
 flowchart TD
-  A[Existing material] --> B[Choose reviewer<br/>Claude or Codex]
-  B --> C[ask-tmux-claude send<br/>or ask-tmux-codex send]
-  C --> D[Reusable tmux consultant reads packet]
-  D --> E[Response file is written]
-  E --> F[Owner CLI applies or summarizes comments]
+    accTitle: Review Existing Material
+    accDescr: Review flow for sending existing files or artifacts to a reusable tmux Claude or Codex consultant session
+
+    existing_material[Existing material] --> choose_reviewer{Choose reviewer}
+    choose_reviewer --> send_packet[Run send]
+    send_packet --> tmux_review[Tmux review]
+    tmux_review --> response_file[Response file]
+    response_file --> owner_apply[Owner applies]
 ```
 
 ### Same Prompt With Owner Synthesis
@@ -125,17 +133,20 @@ Use this when the current CLI should remain responsible for the final answer.
 
 ```mermaid
 flowchart TD
-  A[Prompt X in owner CLI] --> B[ask-tmux-*-pipeline start]
-  B --> C[Tmux Claude or Codex works on same prompt]
-  B --> D[Owner CLI continues reasoning]
-  C --> E{Pipeline status}
-  E -->|ready_for_synthesis| F[Read final_context]
-  E -->|waiting_for_user| G[Ask user the printed question]
-  E -->|blocked| H[Report blocker and artifact path]
-  G --> I[ask-tmux-*-pipeline answer]
-  I --> E
-  D --> F
-  F --> J[Owner CLI writes final synthesized answer]
+    accTitle: Same Prompt Synthesis
+    accDescr: Same-prompt flow where the owner CLI and a tmux CLI work in parallel, then the owner synthesizes the final answer
+
+    owner_prompt[Owner prompt] --> start_pipeline[Run start]
+    start_pipeline --> tmux_work[Tmux work]
+    start_pipeline --> owner_work[Owner work]
+    tmux_work --> status_check{Status}
+    status_check -->|Ready| read_context[Read context]
+    status_check -->|Question| ask_user[Ask user]
+    status_check -->|Blocked| report_blocker[Report blocker]
+    ask_user --> send_answer[Run answer]
+    send_answer --> status_check
+    owner_work --> read_context
+    read_context --> final_answer[Final answer]
 ```
 
 ### Pure / Mirror Mode
@@ -144,12 +155,15 @@ Use this when you mainly want the other CLI's answer.
 
 ```mermaid
 flowchart TD
-  A[Prompt X] --> B[ask-tmux-claude-pure<br/>or ask-tmux-codex-pure]
-  B --> C[Tmux CLI answers]
-  C --> D{Pipeline status}
-  D -->|ready_for_synthesis| E[Owner CLI relays or lightly summarizes final_context]
-  D -->|waiting_for_user| F[Ask user question, then run answer]
-  D -->|blocked| G[Report blocker]
+    accTitle: Pure Mirror Mode
+    accDescr: Pure mode flow where the owner CLI mainly relays the tmux Claude or Codex answer, with clarification and blocker paths
+
+    prompt_x[Prompt X] --> pure_command[Run pure]
+    pure_command --> tmux_answer[Tmux answer]
+    tmux_answer --> status_check{Status}
+    status_check -->|Ready| relay_answer[Relay answer]
+    status_check -->|Question| answer_user[Answer user]
+    status_check -->|Blocked| report_blocker[Report blocker]
 ```
 
 ### Clarification Relay
@@ -158,13 +172,16 @@ Use this after a pipeline exits with code `10` and prints `PIPELINE_STATUS=waiti
 
 ```mermaid
 flowchart TD
-  A[Pipeline prints question and recommended_default] --> B[Owner CLI asks user exactly that question]
-  B --> C[User answers]
-  C --> D[ask-tmux-*-pipeline answer<br/>--pipeline-id id<br/>--answer user-answer]
-  D --> E{New pipeline status}
-  E -->|ready_for_synthesis| F[Read final_context]
-  E -->|waiting_for_user| B
-  E -->|blocked| G[Report blocker and artifacts]
+    accTitle: Clarification Relay
+    accDescr: Clarification flow for relaying a tmux CLI question to the user and sending the answer back into the same pipeline
+
+    tmux_question[Tmux question] --> ask_owner[Ask user]
+    ask_owner --> user_answer[User answer]
+    user_answer --> run_answer[Run answer]
+    run_answer --> next_status{Status}
+    next_status -->|Ready| read_context[Read context]
+    next_status -->|Question| ask_owner
+    next_status -->|Blocked| report_blocker[Report blocker]
 ```
 
 ### Draft Review Before Final Answer
@@ -173,11 +190,14 @@ Use this when you have a current CLI draft and want tmux Claude/Codex to critiqu
 
 ```mermaid
 flowchart TD
-  A[Pipeline has ready_for_synthesis context] --> B[Owner CLI drafts answer]
-  B --> C[ask-tmux-*-pipeline review<br/>--pipeline-id id<br/>--draft draft-text]
-  C --> D[Tmux CLI reviews original prompt, tmux work, and draft]
-  D --> E[Updated final_context includes review]
-  E --> F[Owner CLI revises and sends final answer]
+    accTitle: Draft Review Flow
+    accDescr: Draft review flow where the owner CLI asks tmux Claude or Codex to critique a draft before the final answer is sent
+
+    ready_context[Ready context] --> owner_draft[Owner draft]
+    owner_draft --> run_review[Run review]
+    run_review --> tmux_critique[Tmux critique]
+    tmux_critique --> update_context[Update context]
+    update_context --> send_final[Send final]
 ```
 
 ### Recovery And Inspection
@@ -186,14 +206,18 @@ Use this when you need to inspect a previous pipeline, recover after an interrup
 
 ```mermaid
 flowchart TD
-  A[Have pipeline-id?] -->|Yes| B[Run status with --pipeline-id and --cwd]
-  A -->|No| C[Find pipeline-id from prior output or state]
-  C --> B
-  B --> D{Status}
-  D -->|ready_for_synthesis| E[final-context]
-  D -->|waiting_for_user| F[answer]
-  D -->|blocked| G[Inspect blocker and artifacts]
-  D -->|unclear| H[resume]
+    accTitle: Recovery Inspection Flow
+    accDescr: Recovery flow for locating a pipeline ID, checking status, and choosing whether to fetch context, answer a question, inspect a blocker, or resume
+
+    have_id{Have ID?}
+    have_id -->|Yes| run_status[Run status]
+    have_id -->|No| find_id[Find ID]
+    find_id --> run_status
+    run_status --> status_check{Status}
+    status_check -->|Ready| final_context[Final context]
+    status_check -->|Question| run_answer[Run answer]
+    status_check -->|Blocked| inspect_blocker[Inspect blocker]
+    status_check -->|Unclear| run_resume[Run resume]
 ```
 
 ## Validation
