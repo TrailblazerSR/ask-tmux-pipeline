@@ -4,6 +4,35 @@ set -euo pipefail
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TMPDIR="$(mktemp -d /tmp/ask-tmux-pipeline-smoke.XXXXXX)"
 
+if ! command -v rg >/dev/null 2>&1; then
+  rg() {
+    local fixed=false quiet=false line_numbers=false recursive=false pattern target
+    local flags=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -Fq|-qF) fixed=true; quiet=true; shift ;;
+        -F) fixed=true; shift ;;
+        -q) quiet=true; shift ;;
+        -n) line_numbers=true; shift ;;
+        --) shift; break ;;
+        -*) printf 'rg fallback unsupported option: %s\n' "$1" >&2; return 2 ;;
+        *) break ;;
+      esac
+    done
+    [[ $# -ge 1 ]] || { printf 'rg fallback requires a pattern\n' >&2; return 2; }
+    pattern="$1"
+    shift
+    for target in "$@"; do
+      [[ -d "$target" ]] && recursive=true
+    done
+    if [[ "$fixed" == "true" ]]; then flags+=("-F"); else flags+=("-E"); fi
+    [[ "$quiet" == "true" ]] && flags+=("-q")
+    [[ "$line_numbers" == "true" ]] && flags+=("-n")
+    [[ "$recursive" == "true" ]] && flags+=("-R")
+    grep "${flags[@]}" -- "$pattern" "$@"
+  }
+fi
+
 cleanup() {
   rm -rf "$TMPDIR"
   while IFS= read -r state_file; do

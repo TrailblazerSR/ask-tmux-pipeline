@@ -14,7 +14,42 @@ for ask_tmux_path_entry in \
     PATH="$ask_tmux_path_entry:$PATH"
   fi
 done
+for ask_tmux_path_entry in "$HOME"/.nvm/versions/node/*/bin; do
+  if [[ -d "$ask_tmux_path_entry" ]]; then
+    PATH="$ask_tmux_path_entry:$PATH"
+  fi
+done
 export PATH
+
+if ! command -v rg >/dev/null 2>&1; then
+  ASK_TMUX_RG_FALLBACK=grep
+  rg() {
+    local fixed=false quiet=false line_numbers=false recursive=false pattern target
+    local flags=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -Fq|-qF) fixed=true; quiet=true; shift ;;
+        -F) fixed=true; shift ;;
+        -q) quiet=true; shift ;;
+        -n) line_numbers=true; shift ;;
+        --) shift; break ;;
+        -*) printf 'rg fallback unsupported option: %s\n' "$1" >&2; return 2 ;;
+        *) break ;;
+      esac
+    done
+    [[ $# -ge 1 ]] || { printf 'rg fallback requires a pattern\n' >&2; return 2; }
+    pattern="$1"
+    shift
+    for target in "$@"; do
+      [[ -d "$target" ]] && recursive=true
+    done
+    if [[ "$fixed" == "true" ]]; then flags+=("-F"); else flags+=("-E"); fi
+    [[ "$quiet" == "true" ]] && flags+=("-q")
+    [[ "$line_numbers" == "true" ]] && flags+=("-n")
+    [[ "$recursive" == "true" ]] && flags+=("-R")
+    grep "${flags[@]}" -- "$pattern" "$@"
+  }
+fi
 
 VERSION="0.2.0"
 STATE_ROOT="${ASK_TMUX_STATE_ROOT:-$HOME/.omx/state/consultants}"
@@ -85,6 +120,13 @@ PY
   else
     printf '%s' "$1" | sed ':a;N;$!ba; s/\\/\\\\/g; s/"/\\"/g; s/	/\\t/g; s/\r/\\r/g; s/\n/\\n/g'
   fi
+}
+
+shell_quote() {
+  local value="$1"
+  printf "'"
+  printf '%s' "$value" | sed "s/'/'\\\\''/g"
+  printf "'"
 }
 
 slugify() {
@@ -469,14 +511,15 @@ select_state_file_for_key() {
 }
 
 provider_launch_command() {
-  local provider="$1" stub="$2"
+  local provider="$1" stub="$2" launch_env
   if [[ "$stub" == "true" ]]; then
     printf "%s" "bash -lc 'printf \"ASK_TMUX_STUB_READY\\n\"; while IFS= read -r line; do printf \"ASK_TMUX_STUB_RECEIVED:%s\\n\" \"\$line\"; response=\$(printf \"%s\" \"\$line\" | sed -n \"s/.*ASK_TMUX_RESPONSE=\\([^ ]*\\).*/\\1/p\"); sentinel=\$(printf \"%s\" \"\$line\" | sed -n \"s/.*ASK_TMUX_SENTINEL=\\([^ ]*\\).*/\\1/p\"); if [ -n \"\$response\" ]; then mkdir -p \"\$(dirname \"\$response\")\"; printf \"Stub consultant response for: %s\\n\" \"\$line\" > \"\$response\"; fi; if [ -n \"\$sentinel\" ]; then printf \"%s\\n\" \"\$sentinel\"; fi; done'"
     return
   fi
+  launch_env="env PATH=$(shell_quote "$PATH") HOME=$(shell_quote "$HOME")"
   case "$provider" in
-    claude) printf '%s\n' "claude --dangerously-skip-permissions" ;;
-    codex) printf '%s\n' "codex --dangerously-bypass-approvals-and-sandbox" ;;
+    claude) printf '%s\n' "$launch_env claude --dangerously-skip-permissions" ;;
+    codex) printf '%s\n' "$launch_env codex --dangerously-bypass-approvals-and-sandbox" ;;
     *) die "unknown provider: $provider" ;;
   esac
 }
@@ -579,25 +622,37 @@ codex_update_prompt_choice() {
 
 codex_prompt_needs_second_submit() {
   local text="$1" prompt_marker="$2"
-  printf '%s' "$text" | rg -Fq "$prompt_marker" || return 1
-  if printf '%s' "$text" | rg -q 'Working|Swooping|esc to interrupt|^[[:space:]]*[•⏺✻]'; then
+  if ! printf '%s' "$text" | rg -Fq "$prompt_marker" && ! printf '%s' "$text" | rg -q '\[Pasted Content [0-9]+ chars\]'; then
+    return 1
+  fi
+  if codex_text_shows_activity "$text"; then
     return 1
   fi
   return 0
 }
 
+codex_text_shows_activity() {
+  local text="$1"
+  printf '%s' "$text" | rg -q 'Working|Swooping|esc to interrupt|^[[:space:]]*[•⏺✻]'
+}
+
 send_prompt_to_pane() {
-  local pane="$1" prompt="$2" provider="${3:-}" prompt_marker="${4:-$2}" buffer_name
+  local pane="$1" prompt="$2" provider="${3:-}" prompt_marker="${4:-$2}" buffer_name attempt text
   buffer_name="ask-tmux-send-$$-$RANDOM"
   tmux set-buffer -b "$buffer_name" -- "$prompt"
   tmux paste-buffer -d -b "$buffer_name" -t "$pane"
   sleep 0.3
   tmux send-keys -t "$pane" Enter
   if [[ "$provider" == "codex" ]]; then
-    sleep 0.7
-    if codex_prompt_needs_second_submit "$(capture_pane_text "$pane" 80)" "$prompt_marker"; then
-      tmux send-keys -t "$pane" Enter
-    fi
+    for attempt in 1 2 3 4 5; do
+      sleep 0.7
+      text="$(capture_pane_text "$pane" 80)"
+      if codex_prompt_needs_second_submit "$text" "$prompt_marker"; then
+        tmux send-keys -t "$pane" Enter
+        break
+      fi
+      codex_text_shows_activity "$text" && break
+    done
   fi
 }
 
@@ -609,10 +664,10 @@ pane_is_ready() {
   fi
 	case "$provider" in
 	  claude)
-	    printf '%s' "$text" | rg -q '(^|\s)[>❯]\s*$|What can I help|Type /help'
+	    printf '%s' "$text" | rg -q '(^|[[:space:]])[>❯][[:space:]]*$|What can I help|Type /help'
 	    ;;
 	  codex)
-	    printf '%s' "$text" | rg -q '(^|\s)[›>]\s*$|What can I help|Type /help|Ready' && return 0
+	    printf '%s' "$text" | rg -q '(^|[[:space:]])[›>][[:space:]]*$|What can I help|Type /help|Ready' && return 0
 	    if printf '%s' "$text" | rg -q 'OpenAI Codex' && printf '%s' "$text" | rg -q 'permissions:|/model to change' && printf '%s' "$text" | rg -q 'gpt-[0-9].*·'; then
 	      return 0
 	    fi
@@ -1140,7 +1195,7 @@ cmd_doctor() {
   done
 	  info "ask-tmux-consultant version=$VERSION"
 	  if command -v tmux >/dev/null; then info "PASS tmux=$(tmux -V)"; else info "FAIL tmux missing"; failed=1; fi
-	  if command -v rg >/dev/null; then info "PASS rg=$(command -v rg)"; else info "FAIL rg missing"; failed=1; fi
+	  if [[ "${ASK_TMUX_RG_FALLBACK:-}" == "grep" ]]; then info "PASS rg=fallback-grep"; elif command -v rg >/dev/null; then info "PASS rg=$(command -v rg)"; else info "FAIL rg missing"; failed=1; fi
 	  if command -v flock >/dev/null; then info "PASS flock=$(command -v flock)"; else info "FAIL flock missing"; failed=1; fi
 	  if command -v python3 >/dev/null; then info "PASS python3=$(command -v python3)"; else info "FAIL python3 missing"; failed=1; fi
 	  mkdir -p "$STATE_ROOT" "$ARTIFACT_ROOT" 2>/dev/null || true

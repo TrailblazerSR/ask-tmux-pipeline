@@ -19,7 +19,7 @@ Why: it matches the command family, is provider-neutral, and is short enough to 
 
 - Bash
 - tmux
-- ripgrep (`rg`)
+- ripgrep (`rg`), or the built-in grep fallback for the runner/test subset
 - Python 3
 - Claude CLI and/or Codex CLI for live usage
 
@@ -29,7 +29,7 @@ On macOS, install the shell dependencies with Homebrew:
 brew install tmux ripgrep flock coreutils
 ```
 
-The runner bootstraps Homebrew and GNU coreutils paths when available so non-interactive shells can still find `tmux`, `rg`, `flock`, `realpath -m`, `date -Is`, and provider CLIs.
+The runner bootstraps Homebrew, GNU coreutils, user-local, and nvm paths when available so non-interactive shells can still find `tmux`, `rg`/grep fallback, `flock`, `realpath -m`, `date -Is`, and provider CLIs.
 
 The tools launch Claude/Codex with elevated local permissions, matching the local `ask-tmux` workflow they came from. Only send trusted materials.
 

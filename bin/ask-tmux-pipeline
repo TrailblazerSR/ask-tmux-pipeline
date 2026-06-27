@@ -14,7 +14,42 @@ for ask_tmux_path_entry in \
     PATH="$ask_tmux_path_entry:$PATH"
   fi
 done
+for ask_tmux_path_entry in "$HOME"/.nvm/versions/node/*/bin; do
+  if [[ -d "$ask_tmux_path_entry" ]]; then
+    PATH="$ask_tmux_path_entry:$PATH"
+  fi
+done
 export PATH
+
+if ! command -v rg >/dev/null 2>&1; then
+  ASK_TMUX_RG_FALLBACK=grep
+  rg() {
+    local fixed=false quiet=false line_numbers=false recursive=false pattern target
+    local flags=()
+    while [[ $# -gt 0 ]]; do
+      case "$1" in
+        -Fq|-qF) fixed=true; quiet=true; shift ;;
+        -F) fixed=true; shift ;;
+        -q) quiet=true; shift ;;
+        -n) line_numbers=true; shift ;;
+        --) shift; break ;;
+        -*) printf 'rg fallback unsupported option: %s\n' "$1" >&2; return 2 ;;
+        *) break ;;
+      esac
+    done
+    [[ $# -ge 1 ]] || { printf 'rg fallback requires a pattern\n' >&2; return 2; }
+    pattern="$1"
+    shift
+    for target in "$@"; do
+      [[ -d "$target" ]] && recursive=true
+    done
+    if [[ "$fixed" == "true" ]]; then flags+=("-F"); else flags+=("-E"); fi
+    [[ "$quiet" == "true" ]] && flags+=("-q")
+    [[ "$line_numbers" == "true" ]] && flags+=("-n")
+    [[ "$recursive" == "true" ]] && flags+=("-R")
+    grep "${flags[@]}" -- "$pattern" "$@"
+  }
+fi
 
 VERSION="0.1.0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
@@ -1013,7 +1048,7 @@ cmd_doctor() {
   info "ask-tmux-pipeline version=$VERSION"
   if [[ -x "$BASE_RUNNER" ]]; then info "PASS base_runner=$BASE_RUNNER"; else info "FAIL base_runner_not_executable=$BASE_RUNNER"; failed=1; fi
   if command -v tmux >/dev/null; then info "PASS tmux=$(tmux -V)"; else info "FAIL tmux missing"; failed=1; fi
-  if command -v rg >/dev/null; then info "PASS rg=$(command -v rg)"; else info "FAIL rg missing"; failed=1; fi
+  if [[ "${ASK_TMUX_RG_FALLBACK:-}" == "grep" ]]; then info "PASS rg=fallback-grep"; elif command -v rg >/dev/null; then info "PASS rg=$(command -v rg)"; else info "FAIL rg missing"; failed=1; fi
   if command -v python3 >/dev/null; then info "PASS python3=$(command -v python3)"; else info "FAIL python3 missing"; failed=1; fi
   mkdir -p "$PIPELINE_STATE_ROOT" 2>/dev/null || true
   if [[ -w "$PIPELINE_STATE_ROOT" ]]; then info "PASS pipeline_state_root=$PIPELINE_STATE_ROOT"; else info "FAIL pipeline_state_root_not_writable=$PIPELINE_STATE_ROOT"; failed=1; fi
