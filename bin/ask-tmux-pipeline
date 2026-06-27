@@ -92,6 +92,7 @@ info() {
 read_find_results_into_array() {
   local array_name="$1" line
   shift
+  # Bash 3.2 on macOS has no mapfile/readarray or namerefs.
   eval "$array_name=()"
   while IFS= read -r line; do
     [[ -n "$line" ]] || continue

@@ -35,8 +35,21 @@ cleanup() {
 trap cleanup EXIT
 
 bash -n "$ROOT"/bin/ask-tmux-*
+bash "$ROOT/tests/consultant-unit.sh"
 
-"$ROOT/bin/ask-tmux-claude" send \
+compat_pattern='(^|[[:space:]])(mapfile|readarray)([[:space:]]|$)|local -n|\$\{[A-Za-z_][A-Za-z0-9_]*,,|\$\{[A-Za-z_][A-Za-z0-9_]*\^\^'
+if compat_hits="$(rg -n "$compat_pattern" "$ROOT/bin" 2>&1)"; then
+  printf '%s\n' "$compat_hits" >&2
+  exit 1
+else
+  compat_status=$?
+  if [[ "$compat_status" -ne 1 ]]; then
+    printf '%s\n' "$compat_hits" >&2
+    exit "$compat_status"
+  fi
+fi
+
+claude_smoke_out="$("$ROOT/bin/ask-tmux-claude" send \
   --stub \
   --key consultant-smoke-claude \
   --cwd-mode current \
@@ -44,10 +57,25 @@ bash -n "$ROOT"/bin/ask-tmux-*
   --materials "$ROOT/README.md" \
   --prompt "Smoke consultant Claude path." \
   --wait \
-  --release now >/dev/null
+  --release now)"
+printf '%s\n' "$claude_smoke_out" | rg -q 'Stub consultant response for:'
+printf '%s\n' "$claude_smoke_out" | rg -q 'Smoke consultant Claude path'
 
 stripped_path="/usr/bin:/bin:/usr/sbin:/sbin"
-env -i HOME="$HOME" USER="${USER:-}" PATH="$stripped_path" SHELL="${SHELL:-/bin/sh}" \
+claude_stripped_out="$(env -i HOME="$HOME" USER="${USER:-}" PATH="$stripped_path" SHELL="${SHELL:-/bin/sh}" \
+  "$ROOT/bin/ask-tmux-claude" send \
+    --stub \
+    --key consultant-smoke-claude-stripped \
+    --cwd-mode current \
+    --cwd "$TMPDIR" \
+    --materials "$ROOT/README.md" \
+    --prompt "Smoke consultant Claude stripped path." \
+    --wait \
+    --release now)"
+printf '%s\n' "$claude_stripped_out" | rg -q 'Stub consultant response for:'
+printf '%s\n' "$claude_stripped_out" | rg -q 'Smoke consultant Claude stripped path'
+
+codex_stripped_out="$(env -i HOME="$HOME" USER="${USER:-}" PATH="$stripped_path" SHELL="${SHELL:-/bin/sh}" \
   "$ROOT/bin/ask-tmux-codex" send \
     --stub \
     --key consultant-smoke-codex \
@@ -56,7 +84,9 @@ env -i HOME="$HOME" USER="${USER:-}" PATH="$stripped_path" SHELL="${SHELL:-/bin/
     --materials "$ROOT/README.md" \
     --prompt "Smoke consultant Codex path." \
     --wait \
-    --release now >/dev/null
+    --release now)"
+printf '%s\n' "$codex_stripped_out" | rg -q 'Stub consultant response for:'
+printf '%s\n' "$codex_stripped_out" | rg -q 'Smoke consultant Codex path'
 
 "$ROOT/bin/ask-tmux-codex" send \
   --stub \

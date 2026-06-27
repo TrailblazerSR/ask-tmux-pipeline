@@ -35,7 +35,7 @@ The tools launch Claude/Codex with elevated local permissions, matching the loca
 
 ## Addressed Compatibility Issue
 
-The consultant runner now covers the macOS failures where non-interactive sessions missed Homebrew paths, Bash 3 lacked `mapfile`, Claude/Codex prompts were pasted but not submitted reliably, and Codex startup could block on update/workspace-trust prompts before readiness detection.
+The consultant runner now handles the macOS failures where non-interactive sessions missed Homebrew paths, Bash 3 lacked `mapfile`, Claude/Codex prompts were pasted but not submitted reliably, and Codex startup could block on update/workspace-trust prompts before readiness detection. It also closes the state-lock file descriptor before launching tmux so long-lived sessions do not inherit and hold advisory locks.
 
 ## Install
 
