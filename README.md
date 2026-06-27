@@ -23,7 +23,19 @@ Why: it matches the command family, is provider-neutral, and is short enough to 
 - Python 3
 - Claude CLI and/or Codex CLI for live usage
 
+On macOS, install the shell dependencies with Homebrew:
+
+```bash
+brew install tmux ripgrep flock coreutils
+```
+
+The runner bootstraps Homebrew and GNU coreutils paths when available so non-interactive shells can still find `tmux`, `rg`, `flock`, `realpath -m`, `date -Is`, and provider CLIs.
+
 The tools launch Claude/Codex with elevated local permissions, matching the local `ask-tmux` workflow they came from. Only send trusted materials.
+
+## Addressed Compatibility Issue
+
+The consultant runner now covers the macOS failures where non-interactive sessions missed Homebrew paths, Bash 3 lacked `mapfile`, Claude/Codex prompts were pasted but not submitted reliably, and Codex startup could block on update/workspace-trust prompts before readiness detection.
 
 ## Install
 

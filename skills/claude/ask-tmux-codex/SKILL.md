@@ -11,13 +11,13 @@ Use `/home/h3031/bin/ask-tmux-codex` for Codex consultation from Claude or shell
 ## Quick Start
 
 ```bash
-ask-tmux-codex send --key reviewer --cwd /path/to/project --materials path/to/material.md --prompt "review, comment, and suggest"
+ask-tmux-codex send --key reviewer --cwd /path/to/project --materials path/to/material.md --prompt "review, comment, and suggest" --auto-trust
 ```
 
 For pasted material:
 
 ```bash
-printf '%s\n' "$TEXT" | ask-tmux-codex send --key reviewer --cwd /path/to/project --materials - --prompt "challenge this plan"
+printf '%s\n' "$TEXT" | ask-tmux-codex send --key reviewer --cwd /path/to/project --materials - --prompt "challenge this plan" --auto-trust
 ```
 
 ## Lifecycle

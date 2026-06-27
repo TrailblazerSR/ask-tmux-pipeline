@@ -35,6 +35,7 @@ ask-tmux-codex send \
   --cwd /path/to/project \
   --materials /path/to/material.md \
   --prompt "Review, comment, and suggest. Focus on blockers, missed assumptions, verification gaps, and concrete next actions." \
+  --auto-trust \
   --wait
 ```
 
@@ -51,6 +52,7 @@ ask-tmux-codex send \
   --materials /path/to/run_dir/STAGE_SESSION_PROMPT.md \
   --materials /path/to/run_dir/FULL_HANDOFF.md \
   --task review \
+  --auto-trust \
   --wait
 ```
 
@@ -90,6 +92,7 @@ Use `--cwd` on `capture`, `attach`, and `release` whenever a generic key such as
 - `--wait` / `--no-wait`: block for the response file or leave the session busy for later polling.
 - `--ready-timeout SECONDS`: readiness wait.
 - `--wait-timeout SECONDS`: response wait.
+- `--auto-trust`: allow automatic confirmation of Codex workspace trust prompt.
 - `--release now`: release the tmux session after a successful response.
 
 ## Output Contract

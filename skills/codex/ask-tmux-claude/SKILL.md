@@ -43,6 +43,7 @@ ask-tmux-claude send \
   --cwd /path/to/project \
   --materials /path/to/material.md \
   --prompt "Review, comment, and suggest. Focus on blockers, missed assumptions, verification gaps, and concrete next actions." \
+  --auto-trust \
   --wait
 ```
 
@@ -59,6 +60,7 @@ ask-tmux-claude send \
   --materials /path/to/run_dir/STAGE_SESSION_PROMPT.md \
   --materials /path/to/run_dir/FULL_HANDOFF.md \
   --task review \
+  --auto-trust \
   --wait
 ```
 

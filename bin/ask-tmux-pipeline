@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+for ask_tmux_path_entry in \
+  /opt/homebrew/opt/coreutils/libexec/gnubin \
+  /usr/local/opt/coreutils/libexec/gnubin \
+  "$HOME/.local/bin" \
+  "$HOME/bin" \
+  /opt/homebrew/bin \
+  /opt/homebrew/sbin \
+  /usr/local/bin \
+  /usr/local/sbin; do
+  if [[ -d "$ask_tmux_path_entry" ]]; then
+    PATH="$ask_tmux_path_entry:$PATH"
+  fi
+done
+export PATH
+
 VERSION="0.1.0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 
@@ -72,6 +87,16 @@ warn() {
 
 info() {
   printf '%s\n' "$*"
+}
+
+read_find_results_into_array() {
+  local array_name="$1" line
+  shift
+  eval "$array_name=()"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    eval "$array_name+=(\"\$line\")"
+  done < <(find "$@" 2>/dev/null | sort)
 }
 
 slugify() {
@@ -670,7 +695,7 @@ find_state_by_id() {
       return
     fi
   fi
-  mapfile -t matches < <(find "$PIPELINE_STATE_ROOT" -path "*/$pipeline_id.json" -type f 2>/dev/null | sort)
+  read_find_results_into_array matches "$PIPELINE_STATE_ROOT" -path "*/$pipeline_id.json" -type f
   if (( ${#matches[@]} == 1 )); then
     printf '%s\n' "${matches[0]}"
     return
@@ -689,7 +714,7 @@ find_unique_active_state() {
   if [[ -n "$cwd" ]]; then
     resolved="$(resolve_cwd "$cwd" "$cwd_mode")"
     project_slug="$(project_slug_from_path "$resolved")"
-    mapfile -t matches < <(find "$PIPELINE_STATE_ROOT/$provider/$project_slug" -maxdepth 1 -type f -name '*.json' 2>/dev/null | sort)
+    read_find_results_into_array matches "$PIPELINE_STATE_ROOT/$provider/$project_slug" -maxdepth 1 -type f -name '*.json'
   elif [[ -f "$PIPELINE_STATE_ROOT/current.json" ]]; then
     local current_state
     current_state="$(read_json_field "$PIPELINE_STATE_ROOT/current.json" global_state_file)"

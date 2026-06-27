@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+for ask_tmux_path_entry in \
+  /opt/homebrew/opt/coreutils/libexec/gnubin \
+  /usr/local/opt/coreutils/libexec/gnubin \
+  "$HOME/.local/bin" \
+  "$HOME/bin" \
+  /opt/homebrew/bin \
+  /opt/homebrew/sbin \
+  /usr/local/bin \
+  /usr/local/sbin; do
+  if [[ -d "$ask_tmux_path_entry" ]]; then
+    PATH="$ask_tmux_path_entry:$PATH"
+  fi
+done
+export PATH
+
 VERSION="0.2.0"
 STATE_ROOT="${ASK_TMUX_STATE_ROOT:-$HOME/.omx/state/consultants}"
 ARTIFACT_ROOT="${ASK_TMUX_ARTIFACT_ROOT:-$HOME/.omx/artifacts/consultants}"
@@ -38,7 +53,7 @@ Common options:
   --wait / --no-wait       Wait for done sentinel and print response file. Default: wait.
   --wait-timeout SECONDS
   --ready-timeout SECONDS
-  --auto-trust             Press Enter on Claude workspace trust prompt.
+  --auto-trust             Press Enter on Claude/Codex workspace trust prompt.
   --dry-run
   --all                    For status/release.
   --stale-after DURATION   For cleanup, e.g. 24h, 30m, 3600s.
@@ -391,6 +406,16 @@ find_state_files() {
   fi
 }
 
+read_state_files_into_array() {
+  local array_name="$1" line
+  shift
+  eval "$array_name=()"
+  while IFS= read -r line; do
+    [[ -n "$line" ]] || continue
+    eval "$array_name+=(\"\$line\")"
+  done < <(find_state_files "$@")
+}
+
 prefer_hashed_state_file_if_same_project() {
   local key="$1"
   shift
@@ -423,7 +448,7 @@ select_state_file_for_key() {
   local provider="$1" key="$2" cwd="$3" cwd_mode="$4" command_name="$5"
   local project_slug matches=()
   project_slug="$(project_slug_for_optional_cwd "$cwd" "$cwd_mode")"
-  mapfile -t matches < <(find_state_files "$provider" "$key" false "$project_slug")
+  read_state_files_into_array matches "$provider" "$key" false "$project_slug"
   if (( ${#matches[@]} == 0 )); then
     die "no state file found for key: $key"
   fi
@@ -525,7 +550,30 @@ write_packet() {
 
 capture_pane_text() {
   local pane="$1" lines="${2:-120}"
-  tmux capture-pane -t "$pane" -p -S "-$lines" 2>/dev/null || true
+  tmux capture-pane -J -t "$pane" -p -S "-$lines" 2>/dev/null || true
+}
+
+text_contains_sentinel() {
+  local text="$1" sentinel="$2" compact_text compact_sentinel
+  if printf '%s' "$text" | rg -Fq "$sentinel"; then
+    return 0
+  fi
+  compact_text="$(printf '%s' "$text" | tr -d '[:space:]')"
+  compact_sentinel="$(printf '%s' "$sentinel" | tr -d '[:space:]')"
+  printf '%s' "$compact_text" | rg -Fq "$compact_sentinel"
+}
+
+send_prompt_to_pane() {
+  local pane="$1" prompt="$2" provider="${3:-}" buffer_name
+  buffer_name="ask-tmux-send-$$-$RANDOM"
+  tmux set-buffer -b "$buffer_name" -- "$prompt"
+  tmux paste-buffer -d -b "$buffer_name" -t "$pane"
+  sleep 0.3
+  tmux send-keys -t "$pane" Enter
+  if [[ "$provider" == "codex" ]]; then
+    sleep 0.7
+    tmux send-keys -t "$pane" Enter
+  fi
 }
 
 pane_is_ready() {
@@ -539,7 +587,11 @@ pane_is_ready() {
 	    printf '%s' "$text" | rg -q '(^|\s)[>❯]\s*$|What can I help|Type /help'
 	    ;;
 	  codex)
-	    printf '%s' "$text" | rg -q '(^|\s)[›>]\s*$|What can I help|Type /help|Ready'
+	    printf '%s' "$text" | rg -q '(^|\s)[›>]\s*$|What can I help|Type /help|Ready' && return 0
+	    if printf '%s' "$text" | rg -q 'OpenAI Codex' && printf '%s' "$text" | rg -q 'permissions:|/model to change|gpt-[0-9]'; then
+	      return 0
+	    fi
+	    return 1
 	    ;;
     *)
       return 1
@@ -554,6 +606,23 @@ wait_for_ready() {
   while true; do
     session_exists "${pane%%:*}" || return 1
     text="$(capture_pane_text "$pane" 120)"
+    if pane_is_ready "$provider" "$stub" "$text"; then
+      return 0
+    fi
+    if [[ "$provider" == "codex" ]] && printf '%s' "$text" | rg -q 'Update available!.*->|Update now.*Skip|Skip until next version'; then
+      tmux send-keys -t "$pane" 2 Enter
+      sleep 1
+      continue
+    fi
+    if [[ "$provider" == "codex" ]] && printf '%s' "$text" | rg -q 'Do you trust the contents of this directory|Yes, continue'; then
+      if [[ "$auto_trust" == "true" ]]; then
+        tmux send-keys -t "$pane" Enter
+        sleep 1
+        continue
+      fi
+      warn "consultant is waiting at a Codex workspace trust prompt; attach and confirm, or rerun with --auto-trust"
+      return 2
+    fi
     if printf '%s' "$text" | rg -q 'Quick safety check|Yes, I trust this folder|Enter to confirm'; then
       if [[ "$auto_trust" == "true" ]]; then
         tmux send-keys -t "$pane" Enter
@@ -562,9 +631,6 @@ wait_for_ready() {
         warn "consultant is waiting at a workspace trust prompt; attach and confirm, or rerun with --auto-trust"
         return 2
       fi
-    fi
-    if pane_is_ready "$provider" "$stub" "$text"; then
-      return 0
     fi
     now="$(date +%s)"
     if (( now - start >= timeout )); then
@@ -582,7 +648,7 @@ wait_for_done() {
   while true; do
     session_exists "${pane%%:*}" || return 1
     text="$(capture_pane_text "$pane" 240)"
-    if printf '%s' "$text" | rg -Fq "$sentinel"; then
+    if text_contains_sentinel "$text" "$sentinel"; then
       saw_sentinel="true"
       if response_file_is_fresh "$response_path" "$min_response_epoch"; then
         return 0
@@ -713,7 +779,7 @@ cmd_send() {
   write_packet "$packet" "$provider" "$task" "$resolved" "$owner_prompt" "$response" "$done_sentinel" "${materials[@]}"
 
   if ! session_exists "$session"; then
-    tmux new-session -d -s "$session" -c "$resolved" "$launch_cmd"
+    tmux new-session -d -s "$session" -c "$resolved" "$launch_cmd" 9>&-
     log_event "launch" "$provider" "$session" "live" "$launch_cmd"
   fi
 
@@ -732,7 +798,7 @@ cmd_send() {
   rm -f "$response"
   write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "live" "$release_policy" "$ttl" "$response" "true" "$send_epoch" "" "$done_sentinel"
   short_prompt="ASK_TMUX_RESPONSE=$response ASK_TMUX_SENTINEL=$done_sentinel Read and follow this review packet: $packet . Task: $owner_prompt . When complete, write your full response to the ASK_TMUX_RESPONSE path and print only the ASK_TMUX_SENTINEL value on its own final line."
-  tmux send-keys -t "$pane" "$short_prompt" Enter
+  send_prompt_to_pane "$pane" "$short_prompt" "$provider"
   log_event "send" "$provider" "$session" "sent" "$packet"
 
   info "sent provider=$provider session=$session pane=$pane"
@@ -950,9 +1016,9 @@ cmd_release() {
   local project_filter preferred files=() file session packet state_cwd project_slug response sentinel key_name provider_name release_policy ttl started
   project_filter="$(project_slug_for_optional_cwd "$cwd" "$cwd_mode")"
   if [[ "$all" == "true" ]]; then
-    mapfile -t files < <(find_state_files "$provider" "" true "$project_filter")
+    read_state_files_into_array files "$provider" "" true "$project_filter"
   else
-    mapfile -t files < <(find_state_files "$provider" "$key" false "$project_filter")
+    read_state_files_into_array files "$provider" "$key" false "$project_filter"
     if (( ${#files[@]} == 0 )); then
       die "no state file found for key: $key"
     fi

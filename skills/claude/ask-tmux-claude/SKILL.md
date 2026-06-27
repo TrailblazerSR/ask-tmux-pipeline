@@ -11,13 +11,13 @@ Use `/home/h3031/bin/ask-tmux-claude` for Claude consultation. Prefer it over no
 ## Quick Start
 
 ```bash
-ask-tmux-claude send --key reviewer --cwd /path/to/project --materials path/to/material.md --prompt "review, comment, and suggest"
+ask-tmux-claude send --key reviewer --cwd /path/to/project --materials path/to/material.md --prompt "review, comment, and suggest" --auto-trust
 ```
 
 For pasted material:
 
 ```bash
-printf '%s\n' "$TEXT" | ask-tmux-claude send --key reviewer --cwd /path/to/project --materials - --prompt "review, comment, and suggest"
+printf '%s\n' "$TEXT" | ask-tmux-claude send --key reviewer --cwd /path/to/project --materials - --prompt "review, comment, and suggest" --auto-trust
 ```
 
 ## Lifecycle
