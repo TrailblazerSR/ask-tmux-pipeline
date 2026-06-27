@@ -609,11 +609,11 @@ text_contains_sentinel() {
 
 codex_update_prompt_choice() {
   local text="$1"
-  if printf '%s' "$text" | rg -q '^[[:space:]›]*2\.[[:space:]]*Skip([[:space:]]|$)'; then
+  if printf '%s' "$text" | rg -q '^([[:space:]]|›)*2\.[[:space:]]*Skip([[:space:]]|$)'; then
     printf '2\n'
     return 0
   fi
-  if printf '%s' "$text" | rg -q '^[[:space:]›]*3\.[[:space:]]*Skip([[:space:]]|$)'; then
+  if printf '%s' "$text" | rg -q '^([[:space:]]|›)*3\.[[:space:]]*Skip([[:space:]]|$)'; then
     printf '3\n'
     return 0
   fi
@@ -633,7 +633,7 @@ codex_prompt_needs_second_submit() {
 
 codex_text_shows_activity() {
   local text="$1"
-  printf '%s' "$text" | rg -q 'Working|Swooping|esc to interrupt|^[[:space:]]*[•⏺✻]'
+  printf '%s' "$text" | rg -q 'Working|Swooping|esc to interrupt|^[[:space:]]*(•|⏺|✻)'
 }
 
 send_prompt_to_pane() {
@@ -664,10 +664,10 @@ pane_is_ready() {
   fi
 	case "$provider" in
 	  claude)
-	    printf '%s' "$text" | rg -q '(^|[[:space:]])[>❯][[:space:]]*$|What can I help|Type /help'
+	    printf '%s' "$text" | rg -q '(^|[[:space:]])(>|❯)[[:space:]]*$|What can I help|Type /help'
 	    ;;
 	  codex)
-	    printf '%s' "$text" | rg -q '(^|[[:space:]])[›>][[:space:]]*$|What can I help|Type /help|Ready' && return 0
+	    printf '%s' "$text" | rg -q '(^|[[:space:]])(›|>)[[:space:]]*$|What can I help|Type /help|Ready' && return 0
 	    if printf '%s' "$text" | rg -q 'OpenAI Codex' && printf '%s' "$text" | rg -q 'permissions:|/model to change' && printf '%s' "$text" | rg -q 'gpt-[0-9].*·'; then
 	      return 0
 	    fi
