@@ -1,27 +1,26 @@
 ---
 name: ask-tmux-codex
 description: >-
-  Launch or reuse a Codex tmux consultant session for fresh-context review,
-  comments, suggestions, planning critique, design discussion, verification, or
-  second-opinion Codex analysis. Use when the user or Claude says ask Codex,
-  ask Codex in tmux, ask-tmux-codex, external Codex reviewer, Codex consultant,
-  Codex review/comment/suggest, inspect a session/work summary, or repeated
-  Codex consultation should preserve context.
+  Launch or reuse a Codex tmux consultant session only when the user explicitly
+  names ask-tmux-codex or asks for an ask-tmux Codex reviewer/consultant.
+  Do not use this skill for generic requests to call another Codex session,
+  including Codex sessions on an HPC server, unless ask-tmux-codex is explicitly
+  requested.
 ---
 
 # Ask Tmux Codex
 
-Use this skill when the user explicitly wants a separate Codex CLI session in tmux to review, comment, suggest, plan, critique, or provide a fresh-context second opinion.
+Use this skill when the user explicitly wants `ask-tmux-codex` to run a separate Codex CLI session in tmux for review, comment, suggest, plan, critique, or a fresh-context second opinion.
 
-The shared runner is:
+## Local-Machine Rule
 
-```bash
-/home/h3031/bin/ask-tmux-consultant
-```
+Use only the wrapper installed on the current machine. Do not SSH to another host, call a remote wrapper, or use a Mac wrapper for HPC work from this skill. Cross-machine access is only for explicitly requested repo/install alignment.
 
-The Codex wrapper is:
+Expected local wrapper locations are:
 
 ```bash
+ask-tmux-codex
+/Users/timotheeshi/.local/bin/ask-tmux-codex
 /home/h3031/bin/ask-tmux-codex
 ```
 

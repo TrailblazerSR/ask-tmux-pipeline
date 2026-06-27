@@ -13,22 +13,22 @@ description: >-
 
 Use this skill when the user explicitly wants Claude to review, comment, suggest, plan, critique, or act as a reusable background consultant through tmux.
 
-The shared runner is:
+## Local-Machine Rule
+
+Use only the wrapper installed on the current machine. Do not SSH to another host, call a remote wrapper, or use a Mac wrapper for HPC work from this skill. Cross-machine access is only for explicitly requested repo/install alignment.
+
+Expected local wrapper locations are:
 
 ```bash
-/home/h3031/bin/ask-tmux-consultant
-```
-
-The Claude wrapper is:
-
-```bash
+ask-tmux-claude
+/Users/timotheeshi/.local/bin/ask-tmux-claude
 /home/h3031/bin/ask-tmux-claude
 ```
 
-The typo-compatible alias is also supported:
+The typo-compatible alias is also supported locally when installed:
 
 ```bash
-/home/h3031/bin/ask-tux-claude
+ask-tux-claude
 ```
 
 `ask-tux-claude` is only a compatibility alias for the historical typo; prefer the canonical `ask-tmux-claude` spelling in docs and scripts.

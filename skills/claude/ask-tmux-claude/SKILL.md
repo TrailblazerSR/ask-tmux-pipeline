@@ -6,7 +6,7 @@ allowed-tools: Bash Read Grep Glob
 
 # Ask Tmux Claude
 
-Use `/home/h3031/bin/ask-tmux-claude` for Claude consultation. Prefer it over non-interactive Claude calls for review/comment/suggest work.
+Use the current machine's local `ask-tmux-claude` wrapper for Claude consultation. Prefer it over non-interactive Claude calls for review/comment/suggest work. Do not SSH to another host, call a remote wrapper, or use a Mac wrapper for HPC work from this skill. Cross-machine access is only for explicitly requested repo/install alignment.
 
 ## Quick Start
 

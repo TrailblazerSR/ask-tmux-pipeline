@@ -1,12 +1,12 @@
 ---
 name: ask-tmux-codex
-description: Ask Codex through a reusable tmux consultant session for external review, critique, suggestions, planning, debugging, or cross-agent comments. Use when the user asks Codex, asks Codex in tmux, wants an external Codex reviewer, wants a consultant Codex session, asks Codex to review/comment/suggest on material, challenge a plan, inspect a session/work summary, or when repeated Codex consultation should preserve context across turns.
+description: Ask Codex through a reusable tmux consultant session only when the user explicitly names ask-tmux-codex or asks for an ask-tmux Codex reviewer/consultant. Do not use for generic requests to call another Codex session, including on HPC, unless ask-tmux-codex is explicitly requested.
 allowed-tools: Bash Read Grep Glob
 ---
 
 # Ask Tmux Codex
 
-Use `/home/h3031/bin/ask-tmux-codex` for Codex consultation from Claude or shell workflows.
+Use the current machine's local `ask-tmux-codex` wrapper for Codex consultation from Claude or shell workflows. Do not SSH to another host, call a remote wrapper, or use a Mac wrapper for HPC work from this skill. Cross-machine access is only for explicitly requested repo/install alignment.
 
 ## Quick Start
 

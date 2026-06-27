@@ -1,4 +1,4 @@
 interface:
   display_name: "Ask Tmux Claude"
-  short_description: "Ask Claude through a reusable tmux consultant reviewer session"
-  default_prompt: "Use ask-tmux-claude for ask-Claude, Claude review/comment/suggest, external Claude reviewer, consultant Claude session, ask Claude in tmux, and repeated Claude consultation requests."
+  short_description: "Ask Claude through the local reusable tmux consultant session"
+  default_prompt: "Use ask-tmux-claude only from the current machine for explicit Claude review/comment/suggest or ask-tmux-claude requests. Do not call remote wrappers; cross-machine access is only for repo/install alignment."
