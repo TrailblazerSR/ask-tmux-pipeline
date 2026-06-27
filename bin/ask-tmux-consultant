@@ -620,12 +620,35 @@ codex_update_prompt_choice() {
   return 1
 }
 
-codex_prompt_needs_second_submit() {
-  local text="$1" prompt_marker="$2"
-  if ! printf '%s' "$text" | rg -Fq "$prompt_marker" && ! printf '%s' "$text" | rg -q '\[Pasted Content [0-9]+ chars\]'; then
-    return 1
+codex_hooks_prompt_choice() {
+  local text="$1"
+  if printf '%s' "$text" | rg -q 'Hooks need review|Hooks can run outside the sandbox' && printf '%s' "$text" | rg -q '2\.[[:space:]]*Trust all and continue'; then
+    printf '2\n'
+    return 0
   fi
-  if codex_text_shows_activity "$text"; then
+  return 1
+}
+
+codex_prompt_submit_region() {
+  local text="$1" prompt_marker="$2" line found="false" region=""
+  while IFS= read -r line; do
+    if [[ "$line" == *"$prompt_marker"* || "$line" == *"[Pasted Content "*" chars]"* ]]; then
+      found="true"
+      region="$line"$'\n'
+      continue
+    fi
+    if [[ "$found" == "true" ]]; then
+      region="${region}${line}"$'\n'
+    fi
+  done < <(printf '%s\n' "$text")
+  [[ "$found" == "true" ]] || return 1
+  printf '%s' "$region"
+}
+
+codex_prompt_needs_second_submit() {
+  local text="$1" prompt_marker="$2" region
+  region="$(codex_prompt_submit_region "$text" "$prompt_marker")" || return 1
+  if codex_text_shows_activity "$region"; then
     return 1
   fi
   return 0
@@ -664,7 +687,7 @@ pane_is_ready() {
   fi
 	case "$provider" in
 	  claude)
-	    printf '%s' "$text" | rg -q '(^|[[:space:]])(>|❯)[[:space:]]*$|What can I help|Type /help'
+	    printf '%s' "$text" | rg -q '(^|[[:space:]])(>|❯)[[:space:]]*$|bypass permissions on|What can I help|Type /help'
 	    ;;
 	  codex)
 	    printf '%s' "$text" | rg -q '(^|[[:space:]])(›|>)[[:space:]]*$|What can I help|Type /help|Ready' && return 0
@@ -696,6 +719,16 @@ wait_for_ready() {
         sleep 1
         continue
       fi
+    fi
+    if [[ "$provider" == "codex" ]] && printf '%s' "$text" | rg -q 'Hooks need review|Trust all and continue|Continue without trusting'; then
+      local hooks_choice
+      if [[ "$auto_trust" == "true" ]] && hooks_choice="$(codex_hooks_prompt_choice "$text")"; then
+        tmux send-keys -t "$pane" "$hooks_choice" Enter
+        sleep 1
+        continue
+      fi
+      warn "consultant is waiting at a Codex hooks review prompt; attach and choose a trust option, or rerun with --auto-trust"
+      return 2
     fi
     if [[ "$provider" == "codex" ]] && printf '%s' "$text" | rg -q 'Do you trust the contents of this directory|Yes, continue'; then
       if [[ "$auto_trust" == "true" ]]; then
