@@ -13,16 +13,67 @@ description: >-
 
 Use this skill when the user explicitly wants Claude to review, comment, suggest, plan, critique, or act as a reusable background consultant through tmux.
 
+## Quota Gate
+
+Use `ask-tmux-claude-gated` for every automated or agent-initiated send. The
+gate records budget and deduplication decisions; `ask-tmux-claude` is the raw
+transport and must not be the default route.
+
+```bash
+ask-tmux-claude-gated send \
+  --gate-reason explicit_user_request \
+  --key reviewer \
+  --cwd /path/to/project \
+  --materials /path/to/material.md \
+  --prompt "Review, comment, and suggest." \
+  --wait
+```
+
+Use `explicit_user_request` only when the current user explicitly requests
+Claude review. Otherwise use the narrowest allowed policy reason. Call the raw
+transport only when the user explicitly authorizes a bypass or while debugging
+the gate itself.
+
+## Provider Selection
+
+`ask-tmux-claude` uses `cc-claude` by default. Select DeepSeek for one
+explicitly requested review with `ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek` before
+the command. Only `cc-claude` and `cc-deepseek` are accepted; the runner
+preflights encrypted credentials before detaching tmux.
+
+## Explicit Dual Review
+
+When the user explicitly asks for dual ask-tmux-claude review, use
+`ask-tmux-claude-dual`. It concurrently runs gated `cc-claude` and
+`cc-deepseek` lanes with derived keys `<key>:cc-claude` and
+`<key>:cc-deepseek`, separate tmux state and responses, and labelled output.
+It is advisory/read-only by default, costs two provider requests, and must not
+be substituted for automatic pipeline traffic.
+
+```bash
+ask-tmux-claude-dual send \
+  --gate-reason explicit_user_request \
+  --key reviewer \
+  --cwd /path/to/project \
+  --materials /path/to/material.md \
+  --prompt "Review, comment, and suggest." \
+  --wait
+```
+
+Use the same base key for `status`, `capture`, and `release`. `attach` prints
+the two individual attach commands because a terminal can attach to one tmux
+session at a time.
+
 ## Local-Machine Rule
 
 Use only the wrapper installed on the current machine. Do not SSH to another host, call a remote wrapper, or use a Mac wrapper for HPC work from this skill. Cross-machine access is only for explicitly requested repo/install alignment.
 
-Expected local wrapper locations are:
+Resolve wrappers from the current machine's `PATH`; do not encode another
+machine's home directory in commands or documentation:
 
 ```bash
-ask-tmux-claude
-/Users/timotheeshi/.local/bin/ask-tmux-claude
-/home/h3031/bin/ask-tmux-claude
+command -v ask-tmux-claude-gated
+command -v ask-tmux-claude
 ```
 
 The typo-compatible alias is also supported locally when installed:
@@ -38,7 +89,8 @@ ask-tux-claude
 Prepare materials as files, then send Claude a short pointer prompt:
 
 ```bash
-ask-tmux-claude send \
+ask-tmux-claude-gated send \
+  --gate-reason explicit_user_request \
   --key reviewer \
   --cwd /path/to/project \
   --materials /path/to/material.md \
@@ -54,7 +106,8 @@ Use `--key` to name the reusable consultant identity for a project or stage. Reu
 Inside Hermes Round 5 stages, use Claude as an optional consultant:
 
 ```bash
-ask-tmux-claude send \
+ask-tmux-claude-gated send \
+  --gate-reason explicit_user_request \
   --key S06-reviewer \
   --cwd /path/to/stage/worktree \
   --materials /path/to/run_dir/STAGE_SESSION_PROMPT.md \

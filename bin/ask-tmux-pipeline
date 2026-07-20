@@ -53,6 +53,7 @@ fi
 
 VERSION="0.1.0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+CLAUDE_PIPELINE_GATE_REASON="external_review_required"
 
 default_base_runner() {
   if [[ -x "$SCRIPT_DIR/ask-tmux-consultant" ]]; then
@@ -60,7 +61,8 @@ default_base_runner() {
   elif command -v ask-tmux-consultant >/dev/null 2>&1; then
     command -v ask-tmux-consultant
   else
-    printf '/home/h3031/bin/ask-tmux-consultant\n'
+    printf 'ask-tmux-consultant is not installed or executable on this machine\n' >&2
+    return 127
   fi
 }
 
@@ -170,19 +172,43 @@ invoked_mode() {
 }
 
 provider_wrapper() {
-  local name
+  local name override=""
+  case "$1" in
+    claude)
+      name="ask-tmux-claude-gated"
+      override="${ASK_TMUX_CLAUDE_GATED_BIN:-}"
+      ;;
+    codex)
+      name="ask-tmux-codex"
+      ;;
+    *) die 2 "unknown provider: $1" ;;
+  esac
+
+  if [[ -n "$override" ]]; then
+    if [[ "$override" == */* ]]; then
+      if [[ -x "$override" ]]; then
+        printf '%s\n' "$override"
+        return
+      fi
+    elif command -v "$override" >/dev/null 2>&1; then
+      command -v "$override"
+      return
+    fi
+    printf 'configured %s is not installed or executable: %s\n' "$name" "$override" >&2
+    return 127
+  fi
+
   case "$1" in
     claude|codex)
-      name="ask-tmux-$1"
       if [[ -x "$SCRIPT_DIR/$name" ]]; then
         printf '%s\n' "$SCRIPT_DIR/$name"
       elif command -v "$name" >/dev/null 2>&1; then
         command -v "$name"
       else
-        printf '/home/h3031/bin/%s\n' "$name"
+        printf '%s is not installed or executable on this machine\n' "$name" >&2
+        return 127
       fi
       ;;
-    *) die 2 "unknown provider: $1" ;;
   esac
 }
 
@@ -293,6 +319,50 @@ elif value is not None:
 PY
 }
 
+pipeline_content_digest() {
+  local stage="$1"
+  shift
+  python3 - "$stage" "$@" <<'PY'
+import hashlib
+import sys
+from pathlib import Path
+
+digest = hashlib.sha256()
+digest.update(b"ask-tmux-pipeline-stage-v1\0")
+digest.update(sys.argv[1].encode("utf-8"))
+digest.update(b"\0")
+for raw in sys.argv[2:]:
+    digest.update(raw.encode("utf-8"))
+    digest.update(b"\0")
+    if raw == "-":
+        digest.update(b"stdin-reference\0")
+        continue
+    path = Path(raw).expanduser()
+    try:
+        resolved = path.resolve()
+        stat = resolved.stat()
+    except OSError:
+        digest.update(b"missing\0")
+        continue
+    digest.update(str(resolved).encode("utf-8"))
+    digest.update(b"\0")
+    if resolved.is_file():
+        digest.update(b"file\0")
+        with resolved.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+    elif resolved.is_dir():
+        # A directory material is a live reference, not a copied snapshot.
+        digest.update(b"directory-reference\0")
+        digest.update(str(stat.st_mtime_ns).encode("ascii"))
+    else:
+        digest.update(b"other\0")
+        digest.update(str(stat.st_mode).encode("ascii"))
+    digest.update(b"\0")
+print(digest.hexdigest())
+PY
+}
+
 state_set() {
   local file="$1"
   shift
@@ -310,7 +380,7 @@ try:
 except Exception:
     state = {}
 
-int_fields = {"question_seq", "response_count"}
+int_fields = {"question_seq", "response_count", "review_seq"}
 bool_fields = {"review_requested"}
 
 for raw in sys.argv[2:]:
@@ -542,14 +612,33 @@ EOF
 
 run_consultant() {
   local provider="$1" mode="$2" stage="$3" cwd="$4" key="$5" release_policy="$6" stub="$7" stub_status="$8" stub_question="$9" stub_recommended="${10}" ready_timeout="${11}" wait_timeout="${12}" auto_trust="${13}" fresh="${14}" replace="${15}"
-  shift 15
+  local gate_continuation="${16}"
+  shift 16
   local materials=("$@")
   local wrapper output_file response_file consultant_state output prompt
+  local gate_fingerprint gate_root_digest gate_content_digest transport_status
   wrapper="$(provider_wrapper "$provider")"
   prompt="$(consultant_prompt "$mode" "$stage")"
   output_file="$PIPELINE_DIR/consultant-${stage}-$(date +%Y%m%dT%H%M%S)-$$.out"
 
-  local cmd=("$wrapper" send --key "$key" --cwd "$cwd" --cwd-mode current --task custom --prompt "$prompt" --wait --release "$release_policy" --ready-timeout "$ready_timeout" --wait-timeout "$wait_timeout")
+  local cmd
+  if [[ "$provider" == "claude" ]]; then
+    gate_fingerprint="$(read_json_field "$PIPELINE_STATE_FILE" gate_fingerprint)"
+    gate_root_digest="$(read_json_field "$PIPELINE_STATE_FILE" gate_root_digest)"
+    gate_content_digest="$(pipeline_content_digest "$stage" "${materials[@]+"${materials[@]}"}")"
+    [[ -n "$gate_fingerprint" ]] || die 30 "Claude pipeline is missing its stable gate fingerprint"
+    cmd=("$wrapper" send --gate-reason "$CLAUDE_PIPELINE_GATE_REASON" --gate-fingerprint "$gate_fingerprint" --gate-content-digest "$gate_content_digest" --key "$key" --cwd "$cwd" --cwd-mode current --task custom --prompt "$prompt" --wait --release "$release_policy" --ready-timeout "$ready_timeout" --wait-timeout "$wait_timeout")
+    if [[ "$stage" == "initial" ]]; then
+      cmd+=(--gate-pipeline-start)
+      state_set "$PIPELINE_STATE_FILE" "gate_root_digest=$gate_content_digest"
+    else
+      [[ -n "$gate_continuation" ]] || die 30 "Claude pipeline continuation is missing its stage marker"
+      [[ -n "$gate_root_digest" ]] || die 30 "Claude pipeline continuation has no recorded root digest"
+      cmd+=(--gate-continuation "$gate_continuation" --gate-root-digest "$gate_root_digest")
+    fi
+  else
+    cmd=("$wrapper" send --key "$key" --cwd "$cwd" --cwd-mode current --task custom --prompt "$prompt" --wait --release "$release_policy" --ready-timeout "$ready_timeout" --wait-timeout "$wait_timeout")
+  fi
   [[ "$stub" == "true" ]] && cmd+=(--stub)
   [[ "$auto_trust" == "true" ]] && cmd+=(--auto-trust)
   [[ "$fresh" == "true" ]] && cmd+=(--fresh)
@@ -560,9 +649,22 @@ run_consultant() {
   done
 
   state_set "$PIPELINE_STATE_FILE" "status=waiting_for_consultant" "last_stage=$stage"
-  if ! output="$("${cmd[@]}" 2>&1)"; then
+  if output="$("${cmd[@]}" 2>&1)"; then
+    transport_status=0
+  else
+    transport_status=$?
     printf '%s\n' "$output" > "$output_file"
-    state_set "$PIPELINE_STATE_FILE" "status=blocked" "blocked_reason=consultant transport failed" "last_consultant_output=$output_file"
+    case "$stage" in
+      followup)
+        state_set "$PIPELINE_STATE_FILE" "status=waiting_for_user" "blocked_reason=__DELETE__" "last_transport_error=consultant transport failed (exit $transport_status)" "last_consultant_output=$output_file"
+        ;;
+      review)
+        state_set "$PIPELINE_STATE_FILE" "status=ready_for_synthesis" "blocked_reason=__DELETE__" "last_transport_error=consultant transport failed (exit $transport_status)" "last_consultant_output=$output_file"
+        ;;
+      *)
+        state_set "$PIPELINE_STATE_FILE" "status=blocked" "blocked_reason=consultant transport failed (exit $transport_status)" "last_consultant_output=$output_file"
+        ;;
+    esac
     copy_state_indexes "$PIPELINE_STATE_FILE" "$provider" "$PROJECT_SLUG" "$(read_json_field "$PIPELINE_STATE_FILE" pipeline_id)"
     printf '%s\n' "$output"
     die 30 "tmux consultant transport failed; output=$output_file"
@@ -578,6 +680,7 @@ run_consultant() {
   state_set "$PIPELINE_STATE_FILE" \
     "latest_response_file=$response_file" \
     "last_consultant_output=$output_file" \
+    "last_transport_error=__DELETE__" \
     "consultant_state_file=$consultant_state"
   printf '%s\n' "$response_file"
 }
@@ -845,14 +948,16 @@ cmd_start() {
     "project_slug=$PROJECT_SLUG" \
     "pipeline_dir=$PIPELINE_DIR" \
     "consultant_key=$CONSULTANT_KEY" \
+    "gate_fingerprint=pipeline:$pipeline_id" \
     "status=initializing" \
     "prompt_file=$prompt_path" \
     "review_requested=$review_requested" \
     "question_seq=0" \
+    "review_seq=0" \
     "response_count=0"
 
   copy_state_indexes "$PIPELINE_STATE_FILE" "$provider" "$PROJECT_SLUG" "$pipeline_id"
-  response_file="$(run_consultant "$provider" "$mode" "initial" "$resolved" "$CONSULTANT_KEY" "$release_policy" "$stub" "$stub_status" "$stub_question" "$stub_recommended" "$ready_timeout" "$wait_timeout" "$auto_trust" "$fresh" "$replace" "$prompt_path" "${materials[@]+"${materials[@]}"}")"
+  response_file="$(run_consultant "$provider" "$mode" "initial" "$resolved" "$CONSULTANT_KEY" "$release_policy" "$stub" "$stub_status" "$stub_question" "$stub_recommended" "$ready_timeout" "$wait_timeout" "$auto_trust" "$fresh" "$replace" "" "$prompt_path" "${materials[@]+"${materials[@]}"}")"
   handle_response "$provider" "initial" "$response_file"
 }
 
@@ -886,6 +991,8 @@ cmd_answer() {
     state_file="$(find_unique_active_state "$provider" "$cwd" "$cwd_mode")"
   fi
   load_state_context "$state_file"
+  exec 7>"$PIPELINE_DIR/.operation.lock"
+  flock -w 2 7 || die 30 "pipeline operation is already running: $PIPELINE_DIR"
   status="$(read_json_field "$state_file" status)"
   [[ "$status" == "waiting_for_user" ]] || die 2 "pipeline is not waiting for user input; status=$status"
   answer_text="$(read_text_arg "$answer" "$answer_file")" || die 2 "answer requires --answer or --answer-file"
@@ -903,7 +1010,7 @@ cmd_answer() {
   latest_response="$(read_json_field "$state_file" latest_pipeline_response)"
   mode="$(read_json_field "$state_file" mode)"
   cwd_state="$(read_json_field "$state_file" cwd)"
-  response_file="$(run_consultant "$provider" "$mode" "followup" "$cwd_state" "$CONSULTANT_KEY" "$release_policy" "$stub" "$stub_status" "$stub_question" "$stub_recommended" "$ready_timeout" "$wait_timeout" "$auto_trust" "false" "false" "$prompt_file" "$latest_response" "$answer_path")"
+  response_file="$(run_consultant "$provider" "$mode" "followup" "$cwd_state" "$CONSULTANT_KEY" "$release_policy" "$stub" "$stub_status" "$stub_question" "$stub_recommended" "$ready_timeout" "$wait_timeout" "$auto_trust" "false" "false" "answer:$seq" "$prompt_file" "$latest_response" "$answer_path")"
   handle_response "$provider" "followup" "$response_file"
 }
 
@@ -930,24 +1037,30 @@ cmd_review() {
     esac
   done
   [[ -n "$provider" ]] || die 2 "--provider is required"
-  local state_file status draft_text draft_path prompt_file latest_response mode cwd_state response_file
+  local state_file status draft_text draft_path prompt_file latest_response mode cwd_state response_file review_seq
   if [[ -n "$pipeline_id" ]]; then
     state_file="$(find_state_by_id "$provider" "$pipeline_id" "$cwd" "$cwd_mode")"
   else
     state_file="$(find_unique_active_state "$provider" "$cwd" "$cwd_mode")"
   fi
   load_state_context "$state_file"
+  exec 7>"$PIPELINE_DIR/.operation.lock"
+  flock -w 2 7 || die 30 "pipeline operation is already running: $PIPELINE_DIR"
   status="$(read_json_field "$state_file" status)"
   [[ "$status" == "ready_for_synthesis" ]] || die 2 "pipeline is not ready for review; status=$status"
   draft_text="$(read_text_arg "$draft" "$draft_file")" || die 2 "review requires --draft or --draft-file"
   draft_path="$PIPELINE_DIR/current-draft.md"
   printf '%s\n' "$draft_text" > "$draft_path"
+  review_seq="$(read_json_field "$state_file" review_seq)"
+  [[ "$review_seq" =~ ^[0-9]+$ ]] || review_seq=0
+  review_seq="$((review_seq + 1))"
   state_set "$state_file" "status=reviewing" "current_draft_file=$draft_path" "review_requested=true"
   prompt_file="$(read_json_field "$state_file" prompt_file)"
   latest_response="$(read_json_field "$state_file" latest_pipeline_response)"
   mode="$(read_json_field "$state_file" mode)"
   cwd_state="$(read_json_field "$state_file" cwd)"
-  response_file="$(run_consultant "$provider" "$mode" "review" "$cwd_state" "$CONSULTANT_KEY" "$release_policy" "$stub" "$stub_status" "$stub_question" "$stub_recommended" "$ready_timeout" "$wait_timeout" "$auto_trust" "false" "false" "$prompt_file" "$latest_response" "$draft_path")"
+  response_file="$(run_consultant "$provider" "$mode" "review" "$cwd_state" "$CONSULTANT_KEY" "$release_policy" "$stub" "$stub_status" "$stub_question" "$stub_recommended" "$ready_timeout" "$wait_timeout" "$auto_trust" "false" "false" "review:$review_seq" "$prompt_file" "$latest_response" "$draft_path")"
+  state_set "$state_file" "review_seq=$review_seq"
   handle_response "$provider" "review" "$response_file"
 }
 
@@ -1044,7 +1157,7 @@ cmd_final_context() {
 }
 
 cmd_doctor() {
-  local failed=0
+  local failed=0 claude_gate
   info "ask-tmux-pipeline version=$VERSION"
   if [[ -x "$BASE_RUNNER" ]]; then info "PASS base_runner=$BASE_RUNNER"; else info "FAIL base_runner_not_executable=$BASE_RUNNER"; failed=1; fi
   if command -v tmux >/dev/null; then info "PASS tmux=$(tmux -V)"; else info "FAIL tmux missing"; failed=1; fi
@@ -1055,6 +1168,12 @@ cmd_doctor() {
   for wrapper in "$SCRIPT_DIR/ask-tmux-claude-pipeline" "$SCRIPT_DIR/ask-tmux-codex-pipeline" "$SCRIPT_DIR/ask-tmux-claude-pure" "$SCRIPT_DIR/ask-tmux-codex-pure"; do
     if [[ -x "$wrapper" ]]; then info "PASS wrapper=$wrapper"; else info "FAIL wrapper_missing_or_not_executable=$wrapper"; failed=1; fi
   done
+  if claude_gate="$(provider_wrapper claude)"; then
+    info "PASS claude_gate=$claude_gate"
+  else
+    info "FAIL claude_gate_missing_or_not_executable"
+    failed=1
+  fi
   return "$failed"
 }
 

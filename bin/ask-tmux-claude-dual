@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Run one explicitly requested Claude review through both configured providers.
+# The lanes use distinct keys so their tmux state, packets, and responses cannot collide.
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+ask-tmux-claude-dual <send|status|capture|release|attach> [options]
+
+Run an explicitly requested, advisory dual-provider Claude review. `send`
+starts two gated lanes concurrently: cc-claude and cc-deepseek.
+
+Every command requires --key NAME. The lane keys are NAME:cc-claude and
+NAME:cc-deepseek. `send` also requires a normal gate reason, for example:
+
+  ask-tmux-claude-dual send --gate-reason explicit_user_request \
+    --key reviewer --cwd /path/to/project \
+    --prompt 'Review, comment, and suggest.' --wait
+
+Use --stub or --dry-run for no-provider validation. status, capture, and
+release run against both lane keys and label output. attach prints both attach
+commands, since one terminal cannot attach to both tmux sessions at once.
+USAGE
+}
+
+die() { printf 'ERROR: %s\n' "$*" >&2; exit 2; }
+
+has_gate_reason() {
+  local arg
+  for arg in "$@"; do
+    [[ "$arg" == "--gate-reason" || "$arg" == --gate-reason=* ]] && return 0
+  done
+  return 1
+}
+
+main() {
+  local command="${1:-}"
+  [[ -n "$command" ]] || { usage >&2; exit 2; }
+  shift
+  case "$command" in
+    -h|--help|help) usage; return 0 ;;
+    send|status|capture|release|attach) ;;
+    *) die "unknown command: $command" ;;
+  esac
+
+  local key=""
+  local args_without_key=()
+  while (( $# > 0 )); do
+    case "$1" in
+      --key) (( $# >= 2 )) || die "--key requires a value"; key="$2"; shift 2 ;;
+      --key=*) key="${1#--key=}"; shift ;;
+      *) args_without_key+=("$1"); shift ;;
+    esac
+  done
+  [[ -n "$key" ]] || die "--key NAME is required for a dual review"
+  if [[ "$command" == "send" ]]; then
+    has_gate_reason "${args_without_key[@]}" || die "send requires --gate-reason (normally explicit_user_request)"
+  fi
+
+  local raw gated
+  raw="$(command -v ask-tmux-claude 2>/dev/null || true)"
+  [[ -n "$raw" && -x "$raw" ]] || die "ask-tmux-claude is not installed or executable"
+  if [[ "$command" == "send" ]]; then
+    gated="$(command -v ask-tmux-claude-gated 2>/dev/null || true)"
+    [[ -n "$gated" && -x "$gated" ]] || die "ask-tmux-claude-gated is not installed or executable"
+  fi
+
+  local lane_one_key="${key}:cc-claude" lane_two_key="${key}:cc-deepseek"
+  local lane_one_output lane_two_output
+  lane_one_output="$(mktemp "${TMPDIR:-/tmp}/ask-tmux-claude-dual.cc-claude.XXXXXX")"
+  lane_two_output="$(mktemp "${TMPDIR:-/tmp}/ask-tmux-claude-dual.cc-deepseek.XXXXXX")"
+  trap 'rm -f "${lane_one_output:-}" "${lane_two_output:-}"' EXIT
+
+  if [[ "$command" == "attach" ]]; then
+    printf 'cc-claude: ASK_TMUX_CLAUDE_LAUNCHER=cc-claude %q attach --key %q' "$raw" "$lane_one_key"
+    printf ' %q' "${args_without_key[@]}"; printf '\n'
+    printf 'cc-deepseek: ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek %q attach --key %q' "$raw" "$lane_two_key"
+    printf ' %q' "${args_without_key[@]}"; printf '\n'
+    return 0
+  fi
+
+  local pid_one pid_two rc_one rc_two
+  if [[ "$command" == "send" ]]; then
+    (ASK_TMUX_CLAUDE_LAUNCHER=cc-claude "$gated" send --gate-note "explicit dual review lane=cc-claude" "${args_without_key[@]}" --key "$lane_one_key") >"$lane_one_output" 2>&1 &
+    pid_one=$!
+    (ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek "$gated" send --gate-note "explicit dual review lane=cc-deepseek" "${args_without_key[@]}" --key "$lane_two_key") >"$lane_two_output" 2>&1 &
+    pid_two=$!
+  else
+    (ASK_TMUX_CLAUDE_LAUNCHER=cc-claude "$raw" "$command" "${args_without_key[@]}" --key "$lane_one_key") >"$lane_one_output" 2>&1 &
+    pid_one=$!
+    (ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek "$raw" "$command" "${args_without_key[@]}" --key "$lane_two_key") >"$lane_two_output" 2>&1 &
+    pid_two=$!
+  fi
+  rc_one=0; rc_two=0
+  wait "$pid_one" || rc_one=$?
+  wait "$pid_two" || rc_two=$?
+  printf '%s\n' '=== cc-claude ==='; sed -n '1,4000p' "$lane_one_output"; printf 'cc-claude exit_code=%s\n' "$rc_one"
+  printf '%s\n' '=== cc-deepseek ==='; sed -n '1,4000p' "$lane_two_output"; printf 'cc-deepseek exit_code=%s\n' "$rc_two"
+  (( rc_one == 0 && rc_two == 0 )) || return 1
+}
+
+main "$@"

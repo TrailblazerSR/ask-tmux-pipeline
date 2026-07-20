@@ -16,12 +16,11 @@ Use this skill when the user explicitly wants `ask-tmux-codex` to run a separate
 
 Use only the wrapper installed on the current machine. Do not SSH to another host, call a remote wrapper, or use a Mac wrapper for HPC work from this skill. Cross-machine access is only for explicitly requested repo/install alignment.
 
-Expected local wrapper locations are:
+Resolve the local wrapper from `PATH`; do not encode another machine's home
+directory in commands or documentation:
 
 ```bash
-ask-tmux-codex
-/Users/timotheeshi/.local/bin/ask-tmux-codex
-/home/h3031/bin/ask-tmux-codex
+command -v ask-tmux-codex
 ```
 
 ## Default Pattern

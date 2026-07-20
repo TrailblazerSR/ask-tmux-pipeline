@@ -6,14 +6,14 @@ allowed-tools: Bash Read Grep Glob
 
 # Ask Tmux Codex Pipeline
 
-Use `/home/h3031/bin/ask-tmux-codex-pipeline` when the same owner prompt should run through a reusable tmux Codex session as part of the current answer workflow.
+Use the local `ask-tmux-codex-pipeline` found on `PATH` when the same owner prompt should run through a reusable tmux Codex session as part of the current answer workflow. Do not hard-code another machine's home directory.
 
 Use lower-level `ask-tmux-codex` for simple one-off consultant review. Use this pipeline skill when clarification relay, final synthesis, or optional draft review is needed.
 
 ## Modes
 
 - `synthesize` is the default. Send the owner prompt to tmux Codex, continue local reasoning, then merge Codex's final work into the current answer.
-- `mirror` is the pure mode. Use `/home/h3031/bin/ask-tmux-codex-pure` or `--mode mirror` when the desired behavior is mainly "same prompt to tmux Codex, return Codex's work."
+- `mirror` is the pure mode. Use `ask-tmux-codex-pure` or `--mode mirror` when the desired behavior is mainly "same prompt to tmux Codex, return Codex's work."
 - `review` starts with the prompt and expects a later `review` command with the current CLI draft.
 
 ## Start

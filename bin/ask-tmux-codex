@@ -4,7 +4,11 @@ set -euo pipefail
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 runner="$script_dir/ask-tmux-consultant"
 if [[ ! -x "$runner" ]]; then
-  runner="$(command -v ask-tmux-consultant 2>/dev/null || printf '/home/h3031/bin/ask-tmux-consultant')"
+  runner="$(command -v ask-tmux-consultant 2>/dev/null || true)"
+fi
+if [[ -z "$runner" || ! -x "$runner" ]]; then
+  printf 'ask-tmux-consultant is not installed or executable on this machine\n' >&2
+  exit 127
 fi
 
 cmd="${1:-}"

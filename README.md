@@ -49,6 +49,12 @@ By default this installs:
 - Codex skills to `$HOME/.codex/skills`
 - Claude skills to `$HOME/.claude/skills`
 
+Each replaced script or skill directory is staged before activation and moved to
+`$HOME/.local/share/ask-tmux-pipeline/backups/` (or `ASK_TMUX_BACKUP_DIR`).
+Review that backup before deleting it. The installed Codex Claude-review skill
+routes automated sends through `ask-tmux-claude-gated`; reinstalling this
+repository must not restore direct raw-review guidance.
+
 Override paths if needed:
 
 ```bash
@@ -60,7 +66,21 @@ BIN_DIR=/usr/local/bin CODEX_SKILLS_DIR=/path/to/codex/skills CLAUDE_SKILLS_DIR=
 Review existing material with Claude:
 
 ```bash
-ask-tmux-claude send \
+ask-tmux-claude-gated send \
+  --gate-reason explicit_user_request \
+  --key reviewer \
+  --cwd /path/to/project \
+  --materials /path/to/material.md \
+  --prompt "Review, comment, and suggest." \
+  --wait
+```
+
+For an explicitly requested dual-provider review, use separate concurrent
+`cc-claude` and `cc-deepseek` lanes with labelled results:
+
+```bash
+ask-tmux-claude-dual send \
+  --gate-reason explicit_user_request \
   --key reviewer \
   --cwd /path/to/project \
   --materials /path/to/material.md \
@@ -272,6 +292,15 @@ The smoke test uses `--stub`, so it does not call live Claude or Codex.
 
 ## Safety
 
+- Claude pipeline stages always pass through `ask-tmux-claude-gated` with the
+  automatic reason `external_review_required`; a missing gate is a hard error.
+  Do not replace it with the raw `ask-tmux-claude` transport.
+- A successful initial stage consumes one automatic-review budget slot. Answers
+  and draft reviews are audited continuations of that exact pipeline, not new
+  starts: they must match its project, consultant key, pipeline fingerprint,
+  root digest, ordered stage digest, and fixed 24-hour grant. At most eight
+  continuations are allowed. Unrelated pipelines still obey the daily caps and
+  20-minute project cooldown.
 - Prefer file-backed packets over pasted giant prompts.
 - Keep `--cwd` explicit.
 - Use `--pipeline-id` for `answer`, `review`, `status`, `resume`, and `final-context`.

@@ -6,18 +6,31 @@ allowed-tools: Bash Read Grep Glob
 
 # Ask Tmux Claude
 
-Use the current machine's local `ask-tmux-claude` wrapper for Claude consultation. Prefer it over non-interactive Claude calls for review/comment/suggest work. Do not SSH to another host, call a remote wrapper, or use a Mac wrapper for HPC work from this skill. Cross-machine access is only for explicitly requested repo/install alignment.
+Use the current machine's local `ask-tmux-claude-gated` wrapper for Claude consultation. It budgets automatic sends before invoking the raw `ask-tmux-claude` transport. Do not SSH to another host, call a remote wrapper, or use a Mac wrapper for HPC work from this skill. Cross-machine access is only for explicitly requested repo/install alignment.
+
+## Provider Selection and Explicit Dual Review
+
+The default launcher is `cc-claude`; use
+`ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek` for an explicitly requested DeepSeek
+review. Only those two launcher values are accepted and the runner preflights
+encrypted credentials before detaching tmux.
+
+For an explicitly requested dual review, use `ask-tmux-claude-dual send` with
+`--gate-reason explicit_user_request`. It concurrently runs isolated,
+gated `cc-claude` and `cc-deepseek` lanes using derived keys
+`<key>:cc-claude` and `<key>:cc-deepseek`. It is advisory/read-only by default
+and consumes two provider requests; never substitute it for pipeline traffic.
 
 ## Quick Start
 
 ```bash
-ask-tmux-claude send --key reviewer --cwd /path/to/project --materials path/to/material.md --prompt "review, comment, and suggest" --auto-trust
+ask-tmux-claude-gated send --gate-reason explicit_user_request --key reviewer --cwd /path/to/project --materials path/to/material.md --prompt "review, comment, and suggest" --auto-trust
 ```
 
 For pasted material:
 
 ```bash
-printf '%s\n' "$TEXT" | ask-tmux-claude send --key reviewer --cwd /path/to/project --materials - --prompt "review, comment, and suggest" --auto-trust
+printf '%s\n' "$TEXT" | ask-tmux-claude-gated send --gate-reason explicit_user_request --key reviewer --cwd /path/to/project --materials - --prompt "review, comment, and suggest" --auto-trust
 ```
 
 ## Lifecycle
@@ -45,7 +58,7 @@ The only default write allowed is the required response file named in the packet
 ## Test Without Cost
 
 ```bash
-ask-tmux-claude send --stub --key smoke --cwd /path/to/project --materials <path> --prompt "review, comment, and suggest"
+ask-tmux-claude-gated send --gate-reason explicit_user_request --stub --key smoke --cwd /path/to/project --materials <path> --prompt "review, comment, and suggest"
 ask-tmux-claude capture --key smoke --cwd /path/to/project --lines 80
 ask-tmux-claude release --key smoke --cwd /path/to/project
 ```

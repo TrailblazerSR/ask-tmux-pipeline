@@ -1,0 +1,821 @@
+#!/usr/bin/env python3
+"""Quota gate for ask-tmux-claude.
+
+This wrapper is intentionally conservative. It does not replace the existing
+ask-tmux-claude binary; it provides a default route for automatic Claude review
+requests that should be budgeted and deduplicated.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import fcntl
+from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+
+HOME = Path.home()
+STATE_PATH = HOME / ".omx" / "state" / "review-budget.json"
+LOCK_PATH = STATE_PATH.with_suffix(".lock")
+CONSULTANT_LOG = HOME / ".omx" / "consultants" / "log.jsonl"
+CONTINUATION_LOG = HOME / ".omx" / "consultants" / "continuations.jsonl"
+
+POLICY = {
+    "version": 1,
+    "provider": "claude",
+    "max_daily_project_auto": 3,
+    "max_daily_global_auto": 10,
+    "cooldown_minutes": 20,
+    "pipeline_continuation_ttl_hours": 24,
+    "max_pipeline_continuations": 8,
+    "auto_reasons": [
+        "release_gate",
+        "security_gate",
+        "remote_hpc_gate",
+        "global_config_gate",
+        "destructive_gate",
+        "large_diff_gate",
+        "blocker_escalation",
+        "external_review_required",
+        "user_requested_goal_gate",
+    ],
+    "explicit_reasons": [
+        "explicit_user_request",
+        "user_override",
+    ],
+}
+
+
+class GateDataError(RuntimeError):
+    """Raised when policy evidence cannot be trusted."""
+
+
+def now_local() -> datetime:
+    return datetime.now().astimezone()
+
+
+def parse_dt(raw: str) -> datetime | None:
+    if not raw:
+        return None
+    try:
+        normalized = raw.replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(normalized)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone()
+    except Exception:
+        return None
+
+
+def same_local_day(a: datetime, b: datetime) -> bool:
+    return a.astimezone().date() == b.astimezone().date()
+
+
+def normalize_reason(raw: str) -> str:
+    value = raw.strip().lower().replace("-", "_")
+    aliases = {
+        "explicit": "explicit_user_request",
+        "user_request": "explicit_user_request",
+        "user_requested": "explicit_user_request",
+        "release": "release_gate",
+        "security": "security_gate",
+        "remote": "remote_hpc_gate",
+        "hpc": "remote_hpc_gate",
+        "global_config": "global_config_gate",
+        "large_diff": "large_diff_gate",
+        "blocker": "blocker_escalation",
+        "external_required": "external_review_required",
+    }
+    return aliases.get(value, value)
+
+
+def split_gate_args(argv: list[str]) -> tuple[list[str], dict[str, Any]]:
+    passthrough: list[str] = []
+    meta: dict[str, Any] = {
+        "reason": "",
+        "note": "",
+        "fingerprint": "",
+        "pipeline_start": False,
+        "continuation": "",
+        "content_digest": "",
+        "root_digest": "",
+        "override": False,
+        "show_policy": False,
+    }
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg == "--":
+            passthrough.extend(argv[i:])
+            break
+        if arg in {"--gate-override", "--gate-show-policy", "--gate-pipeline-start"}:
+            key = {
+                "--gate-override": "override",
+                "--gate-show-policy": "show_policy",
+                "--gate-pipeline-start": "pipeline_start",
+            }[arg]
+            meta[key] = True
+            i += 1
+            continue
+        if arg.startswith("--gate-reason="):
+            meta["reason"] = arg.split("=", 1)[1]
+            i += 1
+            continue
+        if arg.startswith("--gate-note="):
+            meta["note"] = arg.split("=", 1)[1]
+            i += 1
+            continue
+        if arg.startswith("--gate-fingerprint="):
+            meta["fingerprint"] = arg.split("=", 1)[1]
+            i += 1
+            continue
+        if arg.startswith("--gate-continuation="):
+            meta["continuation"] = arg.split("=", 1)[1]
+            i += 1
+            continue
+        if arg.startswith("--gate-content-digest="):
+            meta["content_digest"] = arg.split("=", 1)[1]
+            i += 1
+            continue
+        if arg.startswith("--gate-root-digest="):
+            meta["root_digest"] = arg.split("=", 1)[1]
+            i += 1
+            continue
+        if arg in {
+            "--gate-reason",
+            "--gate-note",
+            "--gate-fingerprint",
+            "--gate-continuation",
+            "--gate-content-digest",
+            "--gate-root-digest",
+        }:
+            if i + 1 >= len(argv):
+                raise SystemExit(f"{arg} requires a value")
+            key = arg.removeprefix("--gate-").replace("-", "_")
+            meta[key] = argv[i + 1]
+            i += 2
+            continue
+        passthrough.append(arg)
+        i += 1
+    meta["reason"] = normalize_reason(str(meta["reason"]))
+    return passthrough, meta
+
+
+def values_for(args: list[str], flag: str) -> list[str]:
+    values: list[str] = []
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg == flag and i + 1 < len(args):
+            values.append(args[i + 1])
+            i += 2
+            continue
+        if arg.startswith(f"{flag}="):
+            values.append(arg.split("=", 1)[1])
+        i += 1
+    return values
+
+
+def has_flag(args: list[str], flag: str) -> bool:
+    return flag in args or any(arg == flag or arg.startswith(f"{flag}=") for arg in args)
+
+
+def resolve_cwd(args: list[str]) -> Path:
+    values = values_for(args, "--cwd")
+    if values:
+        return Path(values[-1]).expanduser().resolve()
+    return Path.cwd().resolve()
+
+
+def material_summaries(args: list[str]) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for raw in values_for(args, "--materials"):
+        if raw == "-":
+            summaries.append({"path": "-", "kind": "stdin"})
+            continue
+        path = Path(raw).expanduser()
+        try:
+            resolved = path.resolve()
+            stat = resolved.stat()
+        except Exception:
+            summaries.append({"path": str(path), "kind": "missing"})
+            continue
+        entry: dict[str, Any] = {
+            "path": str(resolved),
+            "kind": "dir" if resolved.is_dir() else "file",
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+        }
+        if resolved.is_file() and stat.st_size <= 512 * 1024:
+            try:
+                entry["sha256"] = hashlib.sha256(resolved.read_bytes()).hexdigest()
+            except Exception:
+                entry["sha256"] = "unreadable"
+        summaries.append(entry)
+    return summaries
+
+
+def build_fingerprint(args: list[str], cwd: Path, explicit: str) -> str:
+    if explicit:
+        if re.fullmatch(r"pipeline:[A-Za-z0-9][A-Za-z0-9._-]{0,127}", explicit):
+            return explicit
+        return hashlib.sha256(explicit.encode("utf-8")).hexdigest()
+    fingerprint_payload = {
+        "cwd": str(cwd),
+        "key": values_for(args, "--key")[-1:] or [],
+        "task": values_for(args, "--task")[-1:] or [],
+        "prompt": values_for(args, "--prompt")[-1:] or [],
+        "materials": material_summaries(args),
+    }
+    encoded = json.dumps(fingerprint_payload, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def load_state() -> dict[str, Any]:
+    if not os.path.lexists(STATE_PATH):
+        return {"version": 1, "policy": POLICY, "events": []}
+    try:
+        state = json.loads(STATE_PATH.read_text())
+    except Exception as exc:
+        raise GateDataError(f"review budget state is unreadable or malformed: {STATE_PATH}: {exc}") from exc
+    if not isinstance(state, dict) or not isinstance(state.get("events"), list):
+        raise GateDataError(f"review budget state has an invalid schema: {STATE_PATH}")
+    for event in state["events"]:
+        if not isinstance(event, dict) or parse_dt(str(event.get("ts", ""))) is None:
+            raise GateDataError(f"review budget state contains an invalid event: {STATE_PATH}")
+    return state
+
+
+def write_state(state: dict[str, Any]) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    state["version"] = 1
+    state["policy"] = POLICY
+    events = state.setdefault("events", [])
+    kept_events = events[-500:]
+    cutoff = now_local() - timedelta(hours=int(POLICY["pipeline_continuation_ttl_hours"]))
+    for event in reversed(events[:-500]):
+        ts = parse_dt(str(event.get("ts", "")))
+        preserve_pipeline_evidence = (
+            event.get("kind") in {"send", "continuation_send", "continuation_reservation"}
+            and event.get("decision") == "allow"
+            and (event.get("pipeline_start") is True or bool(event.get("continuation")))
+            and ts is not None
+            and ts >= cutoff
+        )
+        if event.get("kind") == "send_reservation" or preserve_pipeline_evidence:
+            kept_events.insert(0, event)
+    state["events"] = kept_events
+    tmp = STATE_PATH.with_suffix(".json.tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n")
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, STATE_PATH)
+
+
+def read_consultant_sends() -> list[dict[str, Any]]:
+    events: list[dict[str, Any]] = []
+    if not os.path.lexists(CONSULTANT_LOG):
+        return events
+    try:
+        lines = CONSULTANT_LOG.read_text().splitlines()
+    except Exception as exc:
+        raise GateDataError(f"consultant log is unreadable: {CONSULTANT_LOG}: {exc}") from exc
+    for line in lines:
+        try:
+            event = json.loads(line)
+        except Exception as exc:
+            raise GateDataError(f"consultant log contains malformed JSON: {CONSULTANT_LOG}") from exc
+        if not isinstance(event, dict):
+            raise GateDataError(f"consultant log contains an invalid event: {CONSULTANT_LOG}")
+        if event.get("provider") != "claude" or event.get("event") != "send":
+            continue
+        ts = parse_dt(str(event.get("ts", "")))
+        if not ts:
+            raise GateDataError(f"consultant log contains a Claude send with an invalid timestamp: {CONSULTANT_LOG}")
+        events.append({
+            "ts": ts,
+            "session": str(event.get("session", "")),
+            "detail": str(event.get("detail", "")),
+        })
+    return events
+
+
+def pending_reservations(state: dict[str, Any]) -> list[dict[str, Any]]:
+    reservations: list[dict[str, Any]] = []
+    for event in state.get("events", []):
+        if event.get("kind") != "send_reservation" or event.get("decision") != "allow":
+            continue
+        ts = parse_dt(str(event.get("ts", "")))
+        if not ts:
+            raise GateDataError(f"review budget state contains an invalid reservation: {STATE_PATH}")
+        reservations.append({
+            "ts": ts,
+            "session": "reservation",
+            "detail": str(event.get("cwd", "")),
+        })
+    return reservations
+
+
+@contextmanager
+def gate_lock(timeout_seconds: float = 5.0):
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        lock_fd = os.open(LOCK_PATH, os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError as exc:
+        raise GateDataError(f"cannot open review budget lock: {LOCK_PATH}: {exc}") from exc
+    deadline = time.monotonic() + timeout_seconds
+    try:
+        while True:
+            try:
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise GateDataError(f"timed out acquiring review budget lock: {LOCK_PATH}")
+                time.sleep(0.05)
+        yield
+    finally:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+        finally:
+            os.close(lock_fd)
+
+
+def project_matches(detail: str, cwd: Path) -> bool:
+    try:
+        detail_path = Path(detail).expanduser().resolve()
+    except Exception:
+        return False
+    cwd_text = str(cwd)
+    detail_text = str(detail_path)
+    return detail_text == cwd_text or detail_text.startswith(cwd_text + os.sep)
+
+
+def recent_duplicate(state: dict[str, Any], cwd: Path, fingerprint: str, now: datetime) -> dict[str, Any] | None:
+    for event in reversed(state.get("events", [])):
+        if event.get("kind") not in {"send", "send_reservation"} or event.get("decision") != "allow":
+            continue
+        if event.get("provider") != "claude" or event.get("fingerprint") != fingerprint:
+            continue
+        if event.get("cwd") != str(cwd):
+            continue
+        if event.get("kind") == "send" and int(event.get("exit_code", 1)) != 0:
+            continue
+        ts = parse_dt(str(event.get("ts", "")))
+        if ts and now - ts < timedelta(hours=24):
+            return event
+    return None
+
+
+def parse_continuation_marker(raw: str) -> tuple[str, int] | None:
+    match = re.fullmatch(r"(answer|review):([1-9][0-9]{0,5})", raw)
+    if not match:
+        return None
+    return match.group(1), int(match.group(2))
+
+
+def current_pipeline_grant(
+    state: dict[str, Any], cwd: Path, fingerprint: str, consultant_key: str,
+    root_digest: str, now: datetime
+) -> dict[str, Any] | None:
+    ttl = timedelta(hours=int(POLICY["pipeline_continuation_ttl_hours"]))
+    for event in reversed(state.get("events", [])):
+        if event.get("kind") != "send" or event.get("decision") != "allow":
+            continue
+        if int(event.get("exit_code", 1)) != 0 or event.get("pipeline_start") is not True:
+            continue
+        if not event.get("grant_id"):
+            continue
+        if event.get("provider") != "claude" or event.get("reason") != "external_review_required":
+            continue
+        if (
+            event.get("cwd") != str(cwd)
+            or event.get("fingerprint") != fingerprint
+            or event.get("consultant_key") != consultant_key
+            or event.get("content_digest") != root_digest
+        ):
+            continue
+        ts = parse_dt(str(event.get("ts", "")))
+        if ts and timedelta(0) <= now - ts <= ttl:
+            return event
+    return None
+
+
+def successful_continuation(
+    state: dict[str, Any], cwd: Path, fingerprint: str, consultant_key: str,
+    root_digest: str, grant_id: str, marker: str
+) -> dict[str, Any] | None:
+    for event in reversed(state.get("events", [])):
+        if event.get("kind") != "continuation_send" or event.get("decision") != "allow":
+            continue
+        if int(event.get("exit_code", 1)) != 0:
+            continue
+        if event.get("provider") != "claude":
+            continue
+        if (
+            event.get("cwd") != str(cwd)
+            or event.get("fingerprint") != fingerprint
+            or event.get("consultant_key") != consultant_key
+            or event.get("root_digest") != root_digest
+            or event.get("grant_id") != grant_id
+        ):
+            continue
+        if event.get("continuation") == marker:
+            return event
+    return None
+
+
+def duplicate_continuation(
+    state: dict[str, Any], cwd: Path, fingerprint: str, consultant_key: str,
+    root_digest: str, grant_id: str, marker: str
+) -> dict[str, Any] | None:
+    for event in reversed(state.get("events", [])):
+        if event.get("kind") not in {"continuation_send", "continuation_reservation"}:
+            continue
+        if event.get("decision") != "allow" or event.get("provider") != "claude":
+            continue
+        if (
+            event.get("cwd") != str(cwd)
+            or event.get("fingerprint") != fingerprint
+            or event.get("consultant_key") != consultant_key
+            or event.get("root_digest") != root_digest
+            or event.get("grant_id") != grant_id
+        ):
+            continue
+        if event.get("continuation") != marker:
+            continue
+        if event.get("kind") == "continuation_send" and int(event.get("exit_code", 1)) != 0:
+            continue
+        return event
+    return None
+
+
+def failed_continuation_digest(
+    state: dict[str, Any], cwd: Path, fingerprint: str, consultant_key: str,
+    root_digest: str, grant_id: str, marker: str
+) -> str:
+    for event in reversed(state.get("events", [])):
+        if event.get("kind") != "continuation_send" or event.get("decision") != "allow":
+            continue
+        if int(event.get("exit_code", 0)) == 0 or event.get("provider") != "claude":
+            continue
+        if (
+            event.get("cwd") == str(cwd)
+            and event.get("fingerprint") == fingerprint
+            and event.get("consultant_key") == consultant_key
+            and event.get("root_digest") == root_digest
+            and event.get("grant_id") == grant_id
+            and event.get("continuation") == marker
+        ):
+            return str(event.get("content_digest", ""))
+    return ""
+
+
+def continuation_count(
+    state: dict[str, Any], cwd: Path, fingerprint: str, consultant_key: str,
+    root_digest: str, grant_id: str
+) -> int:
+    count = 0
+    for event in state.get("events", []):
+        if event.get("kind") not in {"continuation_send", "continuation_reservation"}:
+            continue
+        if event.get("decision") != "allow" or event.get("provider") != "claude":
+            continue
+        if (
+            event.get("cwd") != str(cwd)
+            or event.get("fingerprint") != fingerprint
+            or event.get("consultant_key") != consultant_key
+            or event.get("root_digest") != root_digest
+            or event.get("grant_id") != grant_id
+        ):
+            continue
+        count += 1
+    return count
+
+
+def decide(args: list[str], meta: dict[str, Any]) -> dict[str, Any]:
+    now = now_local()
+    cwd = resolve_cwd(args)
+    fingerprint = build_fingerprint(args, cwd, str(meta["fingerprint"]))
+    consultant_key = (values_for(args, "--key")[-1:] or [""])[0]
+    state = load_state()
+    sends = read_consultant_sends() + pending_reservations(state)
+    today_sends = [event for event in sends if same_local_day(event["ts"], now)]
+    today_project_sends = [event for event in today_sends if project_matches(event["detail"], cwd)]
+    last_project_send = max((event["ts"] for event in today_project_sends), default=None)
+    reason = str(meta["reason"])
+    explicit_reasons = set(POLICY["explicit_reasons"])
+    auto_reasons = set(POLICY["auto_reasons"])
+    is_explicit = reason in explicit_reasons
+
+    decision = {
+        "decision": "allow",
+        "provider": "claude",
+        "reason": reason,
+        "cwd": str(cwd),
+        "fingerprint": fingerprint,
+        "consultant_key": consultant_key,
+        "policy": POLICY,
+        "counts": {
+            "daily_global_sends": len(today_sends),
+            "daily_project_sends": len(today_project_sends),
+        },
+        "last_project_send": last_project_send.isoformat() if last_project_send else "",
+        "budget_counted": True,
+        "message": "allowed",
+    }
+
+    continuation = str(meta.get("continuation", ""))
+    pipeline_start = meta.get("pipeline_start") is True
+    content_digest = str(meta.get("content_digest", ""))
+    root_digest = str(meta.get("root_digest", ""))
+    pipeline_fingerprint = re.fullmatch(
+        r"pipeline:[A-Za-z0-9][A-Za-z0-9._-]{0,127}", str(meta.get("fingerprint", ""))
+    )
+    if (content_digest or root_digest) and not (continuation or pipeline_start):
+        decision.update({"decision": "deny", "message": "pipeline digests require a pipeline gate marker"})
+        return decision
+    if continuation or pipeline_start:
+        if meta.get("override"):
+            decision.update({"decision": "deny", "message": "pipeline gate markers cannot be overridden"})
+            return decision
+        if reason != "external_review_required":
+            decision.update({
+                "decision": "deny",
+                "message": "pipeline gate markers require --gate-reason external_review_required",
+            })
+            return decision
+        if not pipeline_fingerprint:
+            decision.update({
+                "decision": "deny",
+                "message": "pipeline gate markers require --gate-fingerprint pipeline:<id>",
+            })
+            return decision
+        if not consultant_key:
+            decision.update({"decision": "deny", "message": "pipeline gate markers require --key"})
+            return decision
+        if not re.fullmatch(r"[0-9a-f]{64}", content_digest):
+            decision.update({
+                "decision": "deny",
+                "message": "pipeline gate markers require a lowercase SHA-256 --gate-content-digest",
+            })
+            return decision
+        if continuation and pipeline_start:
+            decision.update({"decision": "deny", "message": "pipeline start cannot also be a continuation"})
+            return decision
+        if pipeline_start and root_digest:
+            decision.update({"decision": "deny", "message": "pipeline start must not provide --gate-root-digest"})
+            return decision
+
+    if meta.get("override"):
+        decision["message"] = "allowed by --gate-override"
+        return decision
+    if not reason:
+        decision.update({"decision": "deny", "message": "missing --gate-reason"})
+        return decision
+    if reason not in auto_reasons and reason not in explicit_reasons:
+        decision.update({"decision": "deny", "message": f"unsupported --gate-reason: {reason}"})
+        return decision
+    if continuation:
+        parsed_marker = parse_continuation_marker(continuation)
+        decision["budget_counted"] = False
+        decision["continuation"] = continuation
+        decision["content_digest"] = content_digest
+        decision["root_digest"] = root_digest
+        if not parsed_marker:
+            decision.update({
+                "decision": "deny",
+                "message": "invalid --gate-continuation; expected answer:<n> or review:<n>",
+            })
+            return decision
+        if not re.fullmatch(r"[0-9a-f]{64}", root_digest):
+            decision.update({
+                "decision": "deny",
+                "message": "pipeline continuation requires a lowercase SHA-256 --gate-root-digest",
+            })
+            return decision
+        grant = current_pipeline_grant(
+            state, cwd, fingerprint, consultant_key, root_digest, now
+        )
+        if not grant:
+            decision.update({
+                "decision": "deny",
+                "message": "pipeline continuation has no successful same-project start within the continuation TTL",
+            })
+            return decision
+        grant_id = str(grant["grant_id"])
+        decision["grant_id"] = grant_id
+        failed_digest = failed_continuation_digest(
+            state, cwd, fingerprint, consultant_key, root_digest, grant_id, continuation
+        )
+        if failed_digest and failed_digest != content_digest:
+            decision.update({
+                "decision": "deny",
+                "message": "failed pipeline continuation may be retried only with identical stage content",
+            })
+            return decision
+        duplicate = duplicate_continuation(
+            state, cwd, fingerprint, consultant_key, root_digest, grant_id, continuation
+        )
+        if duplicate:
+            decision.update({
+                "decision": "deny",
+                "message": f"pipeline continuation already sent or reserved: {continuation}",
+            })
+            return decision
+        count = continuation_count(
+            state, cwd, fingerprint, consultant_key, root_digest, grant_id
+        )
+        if count >= int(POLICY["max_pipeline_continuations"]):
+            decision.update({
+                "decision": "deny",
+                "message": (
+                    "pipeline continuation cap reached: "
+                    f"{count}/{POLICY['max_pipeline_continuations']}"
+                ),
+            })
+            return decision
+        stage, sequence = parsed_marker
+        if sequence > 1:
+            previous = f"{stage}:{sequence - 1}"
+            if not successful_continuation(
+                state, cwd, fingerprint, consultant_key, root_digest, grant_id, previous
+            ):
+                decision.update({
+                    "decision": "deny",
+                    "message": f"pipeline continuation is out of sequence; missing successful {previous}",
+                })
+                return decision
+        decision["message"] = f"allowed audited pipeline continuation: {continuation}"
+        return decision
+    if is_explicit:
+        decision["message"] = "allowed by explicit user request"
+        return decision
+
+    duplicate = recent_duplicate(state, cwd, fingerprint, now)
+    if duplicate:
+        decision.update({
+            "decision": "deny",
+            "message": f"duplicate Claude review for unchanged materials within 24h: {duplicate.get('ts', '')}",
+        })
+        return decision
+    if len(today_project_sends) >= int(POLICY["max_daily_project_auto"]):
+        decision.update({
+            "decision": "deny",
+            "message": f"project auto-review cap reached: {len(today_project_sends)}/{POLICY['max_daily_project_auto']}",
+        })
+        return decision
+    if len(today_sends) >= int(POLICY["max_daily_global_auto"]):
+        decision.update({
+            "decision": "deny",
+            "message": f"global auto-review cap reached: {len(today_sends)}/{POLICY['max_daily_global_auto']}",
+        })
+        return decision
+    if last_project_send:
+        elapsed = now - last_project_send
+        cooldown = timedelta(minutes=int(POLICY["cooldown_minutes"]))
+        if elapsed < cooldown:
+            remaining = int((cooldown - elapsed).total_seconds() // 60) + 1
+            decision.update({
+                "decision": "deny",
+                "message": f"project cooldown active; wait about {remaining} minute(s)",
+            })
+            return decision
+    return decision
+
+
+def record(
+    kind: str,
+    decision: dict[str, Any],
+    meta: dict[str, Any],
+    exit_code: int | None = None,
+    reservation_id: str = "",
+) -> None:
+    state = load_state()
+    event = {
+        "ts": now_local().isoformat(),
+        "kind": kind,
+        "provider": "claude",
+        "decision": decision["decision"],
+        "reason": decision.get("reason", ""),
+        "cwd": decision.get("cwd", ""),
+        "fingerprint": decision.get("fingerprint", ""),
+        "consultant_key": decision.get("consultant_key", ""),
+        "pipeline_start": meta.get("pipeline_start") is True,
+        "continuation": meta.get("continuation", ""),
+        "budget_counted": decision.get("budget_counted", True),
+        "content_digest": meta.get("content_digest", ""),
+        "root_digest": meta.get("root_digest", ""),
+        "grant_id": decision.get("grant_id", ""),
+        "message": decision.get("message", ""),
+        "note": meta.get("note", ""),
+        "counts": decision.get("counts", {}),
+    }
+    if exit_code is not None:
+        event["exit_code"] = exit_code
+    if reservation_id:
+        event["reservation_id"] = reservation_id
+    state.setdefault("events", []).append(event)
+    write_state(state)
+
+
+def complete_reservation(reservation_id: str, kind: str, exit_code: int) -> None:
+    state = load_state()
+    for event in reversed(state.get("events", [])):
+        if event.get("reservation_id") != reservation_id:
+            continue
+        expected = "continuation_reservation" if kind.startswith("continuation_") else "send_reservation"
+        if event.get("kind") != expected:
+            raise GateDataError(f"review budget reservation is not pending: {reservation_id}")
+        event["kind"] = kind
+        event["exit_code"] = exit_code
+        event["completed_at"] = now_local().isoformat()
+        write_state(state)
+        return
+    raise GateDataError(f"review budget reservation is missing: {reservation_id}")
+
+
+def real_binary() -> str | None:
+    configured = os.environ.get("ASK_TMUX_CLAUDE_BIN", "").strip()
+    if configured:
+        return shutil.which(configured)
+    return shutil.which("ask-tmux-claude")
+
+
+def main(argv: list[str]) -> int:
+    try:
+        passthrough, meta = split_gate_args(argv)
+        if meta.get("show_policy") or (passthrough and passthrough[0] == "policy"):
+            print(json.dumps(POLICY, indent=2, sort_keys=True))
+            return 0
+        if not passthrough:
+            print("Usage: ask-tmux-claude-gated <check|send|status|capture|attach|release|cleanup|doctor> [options]", file=sys.stderr)
+            return 2
+
+        command = passthrough[0]
+        if command == "check":
+            send_like_args = ["send"] + passthrough[1:]
+            with gate_lock():
+                decision = decide(send_like_args, meta)
+                record("check", decision, meta)
+            print(json.dumps(decision, indent=2, sort_keys=True))
+            return 0 if decision["decision"] == "allow" else 76
+
+        if command != "send":
+            binary = real_binary()
+            if not binary:
+                print("ask-tmux-claude binary not found", file=sys.stderr)
+                return 127
+            return subprocess.run([binary] + passthrough).returncode
+
+        binary = real_binary()
+        if not binary:
+            print("ask-tmux-claude binary not found", file=sys.stderr)
+            return 127
+        with gate_lock():
+            decision = decide(passthrough, meta)
+            is_continuation = bool(meta.get("continuation"))
+            if decision["decision"] != "allow":
+                denied_kind = "continuation_send" if is_continuation else "send"
+                record(denied_kind, decision, meta, exit_code=76)
+                print(f"ask-tmux-claude-gated: denied: {decision['message']}", file=sys.stderr)
+                print(json.dumps(decision, indent=2, sort_keys=True), file=sys.stderr)
+                return 76
+            reservation_id = f"{os.getpid()}-{time.time_ns()}"
+            if meta.get("pipeline_start") is True:
+                decision["grant_id"] = reservation_id
+            reservation_kind = "continuation_reservation" if is_continuation else "send_reservation"
+            record(reservation_kind, decision, meta, reservation_id=reservation_id)
+
+        print(f"ask-tmux-claude-gated: allowed: {decision['message']}", file=sys.stderr)
+        child_env = None
+        if is_continuation:
+            child_env = os.environ.copy()
+            child_env["ASK_TMUX_LOG_PATH"] = str(CONTINUATION_LOG)
+        proc = subprocess.run([binary] + passthrough, env=child_env)
+        if is_continuation:
+            kind = (
+                "continuation_send_dry_run"
+                if has_flag(passthrough, "--dry-run")
+                else "continuation_send"
+            )
+        else:
+            kind = "send_dry_run" if has_flag(passthrough, "--dry-run") else "send"
+        with gate_lock():
+            complete_reservation(reservation_id, kind, proc.returncode)
+        return proc.returncode
+    except GateDataError as exc:
+        print(f"ask-tmux-claude-gated: denied: {exc}", file=sys.stderr)
+        return 78
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

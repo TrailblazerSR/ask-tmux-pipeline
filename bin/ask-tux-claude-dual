@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Historical typo compatibility for ask-tmux-claude-dual.
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+target="$script_dir/ask-tmux-claude-dual"
+if [[ ! -x "$target" ]]; then
+  target="$(command -v ask-tmux-claude-dual 2>/dev/null || true)"
+fi
+if [[ -z "$target" || ! -x "$target" ]]; then
+  printf 'ask-tmux-claude-dual is not installed or executable on this machine\n' >&2
+  exit 127
+fi
+exec "$target" "$@"

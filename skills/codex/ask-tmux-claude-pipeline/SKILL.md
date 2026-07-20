@@ -12,14 +12,27 @@ description: >-
 
 # Ask Tmux Claude Pipeline
 
-Use `/home/h3031/bin/ask-tmux-claude-pipeline` when the same owner prompt should run through a reusable tmux Claude session as part of the current answer workflow.
+Use the local `ask-tmux-claude-pipeline` found on `PATH` when the same owner prompt should run through a reusable tmux Claude session as part of the current answer workflow. Do not hard-code another machine's home directory.
 
 Use the lower-level `ask-tmux-claude` skill for simple one-off consultant review. Use this pipeline skill when clarification relay, final synthesis, or optional draft review is needed.
+
+Every Claude pipeline stage is automatic review traffic. The dispatcher must invoke local `ask-tmux-claude-gated send --gate-reason external_review_required` and fail closed if that gate is unavailable. Never replace this route with the raw `ask-tmux-claude` transport.
+
+One successful initial stage consumes one automatic-review budget slot. Follow-up answers and draft reviews are allowed only as ordered continuations of the same project, consultant key, pipeline fingerprint, and content-digest grant. The grant has a fixed 24-hour lifetime and an eight-continuation cap; unrelated pipelines remain subject to the normal daily caps and 20-minute project cooldown.
+
+## Provider Selection and Dual Boundary
+
+Pipelines default to `cc-claude`; prefix an explicitly requested DeepSeek
+pipeline with `ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek`. Unlock encrypted
+credentials once interactively before a detached launch. `ask-tmux-claude-dual`
+is only for explicitly requested, one-off dual-provider review packets. Do not
+substitute it into the single-consultant pipeline continuation flow; preserve
+its two labelled outputs and synthesize them locally instead.
 
 ## Modes
 
 - `synthesize` is the default. Send the owner prompt to tmux Claude, continue local reasoning, then merge Claude's final work into the current answer.
-- `mirror` is the pure mode. Use `/home/h3031/bin/ask-tmux-claude-pure` or `--mode mirror` when the desired behavior is mainly "same prompt to tmux Claude, return Claude's work."
+- `mirror` is the pure mode. Use `ask-tmux-claude-pure` or `--mode mirror` when the desired behavior is mainly "same prompt to tmux Claude, return Claude's work."
 - `review` starts with the prompt and expects a later `review` command with the current CLI draft.
 
 ## Start

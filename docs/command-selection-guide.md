@@ -17,13 +17,19 @@ Use `ask-tmux-claude-pure` / `ask-tmux-codex-pure` when the user wants the same 
 Use when the user says: "ask Claude to review/comment/suggest", "get Claude's critique", "have Claude inspect this plan", or "Claude second opinion".
 
 ```bash
-ask-tmux-claude send \
+ask-tmux-claude-gated send \
+  --gate-reason explicit_user_request \
   --key reviewer \
   --cwd /path/to/project \
   --materials /path/to/material.md \
   --prompt "Review, comment, and suggest. Focus on blockers, missed assumptions, verification gaps, and concrete next actions." \
   --wait
 ```
+
+For an explicitly requested dual-provider review, use
+`ask-tmux-claude-dual send` with the same arguments. It runs isolated gated
+`cc-claude` and `cc-deepseek` lanes concurrently, labels both results, and
+costs two provider requests. Do not use it for automatic pipeline traffic.
 
 ### 2. Simple Codex Review
 
@@ -41,6 +47,8 @@ ask-tmux-codex send \
 ### 3. Same Prompt Through Tmux Claude, Then Synthesize
 
 Use when prompt X should be sent to tmux Claude while the current CLI remains responsible for final synthesis.
+
+The dispatcher treats every Claude pipeline stage as automatic review traffic and routes it through `ask-tmux-claude-gated` with `--gate-reason external_review_required`. It fails closed when that local gate is unavailable; do not bypass it with the raw transport. The initial stage consumes one budget slot. Later answers and draft reviews are bounded, ordered continuations of the same project/key/pipeline and content-digest grant for up to 24 hours and eight continuation sends; a different pipeline still encounters the normal caps and cooldown.
 
 ```bash
 ask-tmux-claude-pipeline start \
@@ -111,7 +119,7 @@ ask-tmux-claude-pipeline final-context --pipeline-id <id> --cwd /path/to/project
 
 ## Short Rule
 
-- Review existing material: `ask-tmux-claude send` or `ask-tmux-codex send`.
+- Review existing material: `ask-tmux-claude-gated send` or `ask-tmux-codex send`.
 - Route this same prompt into another CLI: `ask-tmux-*-pipeline start`.
 - Mirror with minimal synthesis: `ask-tmux-*-pure`.
 - Continue after consultant asks a question: `ask-tmux-*-pipeline answer`.

@@ -510,15 +510,41 @@ select_state_file_for_key() {
   printf '%s\n' "${matches[0]}"
 }
 
+selected_claude_launcher() {
+  local launcher="${ASK_TMUX_CLAUDE_LAUNCHER:-cc-claude}"
+  case "$launcher" in
+    cc-claude|cc-deepseek) ;;
+    *)
+      printf 'ASK_TMUX_CLAUDE_LAUNCHER must be cc-claude or cc-deepseek (got: %s)\n' "$launcher" >&2
+      return 1
+      ;;
+  esac
+  if ! command -v "$launcher" >/dev/null 2>&1; then
+    printf 'Claude launcher is not installed or executable: %s\n' "$launcher" >&2
+    return 1
+  fi
+  command -v "$launcher"
+}
+
+preflight_claude_credentials() {
+  local launcher
+  [[ "$1" == "true" ]] && return
+  launcher="$(selected_claude_launcher)" || die 'Claude provider launcher selection failed'
+  "$launcher" --version >/dev/null || die "Claude provider preflight failed for $launcher"
+}
+
 provider_launch_command() {
-  local provider="$1" stub="$2" launch_env
+  local provider="$1" stub="$2" launch_env claude_launcher
   if [[ "$stub" == "true" ]]; then
     printf "%s" "bash -lc 'printf \"ASK_TMUX_STUB_READY\\n\"; while IFS= read -r line; do printf \"ASK_TMUX_STUB_RECEIVED:%s\\n\" \"\$line\"; response=\$(printf \"%s\" \"\$line\" | sed -n \"s/.*ASK_TMUX_RESPONSE=\\([^ ]*\\).*/\\1/p\"); sentinel=\$(printf \"%s\" \"\$line\" | sed -n \"s/.*ASK_TMUX_SENTINEL=\\([^ ]*\\).*/\\1/p\"); if [ -n \"\$response\" ]; then mkdir -p \"\$(dirname \"\$response\")\"; printf \"Stub consultant response for: %s\\n\" \"\$line\" > \"\$response\"; fi; if [ -n \"\$sentinel\" ]; then printf \"%s\\n\" \"\$sentinel\"; fi; done'"
     return
   fi
   launch_env="env PATH=$(shell_quote "$PATH") HOME=$(shell_quote "$HOME")"
   case "$provider" in
-    claude) printf '%s\n' "$launch_env claude --dangerously-skip-permissions" ;;
+    claude)
+      claude_launcher="$(selected_claude_launcher)" || die 'Claude provider launcher selection failed'
+      printf '%s\n' "$launch_env bash -lc 'exec \"\$@\"' bash $(shell_quote "$claude_launcher") --dangerously-skip-permissions"
+      ;;
     codex) printf '%s\n' "$launch_env codex --dangerously-bypass-approvals-and-sandbox" ;;
     *) die "unknown provider: $provider" ;;
   esac
@@ -818,7 +844,7 @@ cmd_send() {
   [[ "$wait_timeout" =~ ^[0-9]+$ ]] || die "--wait-timeout must be seconds"
 
   local resolved project_slug key_id session pane state_file lock_file packet_root packet response_root response done_sentinel launch_cmd short_prompt run_stamp
-  resolved="$(resolve_cwd "$cwd" "$cwd_mode" "${materials[@]}")"
+  resolved="$(resolve_cwd "$cwd" "$cwd_mode" "${materials[@]-}")"
   project_slug="$(project_slug_from_path "$resolved")"
   key="${key:-$task}"
   key_id="$(key_id_from_key "$key")"
@@ -832,6 +858,9 @@ cmd_send() {
   response_root="$resolved/.omx/consultants/responses"
   response="$response_root/${run_stamp}-${provider}-${key_id}.md"
   done_sentinel="<<<ASK_TMUX_DONE:${provider}:${key_id}:$(date +%s):$$>>>"
+  if [[ "$provider" == "claude" ]]; then
+    preflight_claude_credentials "$stub"
+  fi
   launch_cmd="$(provider_launch_command "$provider" "$stub")"
 
   if [[ "$dry_run" == "true" ]]; then
@@ -892,7 +921,7 @@ cmd_send() {
     fi
   fi
 
-  write_packet "$packet" "$provider" "$task" "$resolved" "$owner_prompt" "$response" "$done_sentinel" "${materials[@]}"
+  write_packet "$packet" "$provider" "$task" "$resolved" "$owner_prompt" "$response" "$done_sentinel" "${materials[@]-}"
 
   if ! session_exists "$session"; then
     tmux new-session -d -s "$session" -c "$resolved" "$launch_cmd" 9>&-
@@ -1236,15 +1265,16 @@ cmd_doctor() {
 	  for p in ${provider:-claude codex}; do
 	    if command -v "$p" >/dev/null; then info "PASS ${p}_cli=$(command -v "$p")"; else info "FAIL ${p}_cli missing"; failed=1; fi
 	    if [[ "$p" == "claude" ]]; then
-	      info "PASS ${p}_launch=claude --dangerously-skip-permissions"
+      if launcher="$(selected_claude_launcher)"; then
+        info "PASS ${p}_launch=${launcher} --dangerously-skip-permissions"
+        if claude-provider-doctor --check-update >/dev/null 2>&1; then info "PASS ${p}_provider_doctor"; else info "FAIL ${p}_provider_doctor"; failed=1; fi
+      else
+        info "FAIL ${p}_launcher"; failed=1
+      fi
 	    else
 	      info "PASS ${p}_launch=codex --dangerously-bypass-approvals-and-sandbox"
 	    fi
-	    if bash -ic "type ${p}-yolo" >/dev/null 2>&1; then
-	      info "INFO ${p}_yolo_alias_present"
-	    else
-	      info "INFO ${p}_yolo_alias_not_required"
-	    fi
+    if command -v "${p}-yolo" >/dev/null; then info "PASS ${p}_yolo=$(command -v "${p}-yolo")"; else info "INFO ${p}_yolo_not_required"; fi
 	  done
   return "$failed"
 }
