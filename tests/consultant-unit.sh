@@ -22,6 +22,27 @@ assert_not_ready() {
   fi
 }
 
+tmux() {
+  case "$1" in
+    display-message)
+      [[ "$*" == *'%42'* ]] || return 1
+      printf '%%42\n'
+      ;;
+    list-panes)
+      printf '%%42\n'
+      ;;
+    *)
+      command tmux "$@"
+      ;;
+  esac
+}
+
+[[ "$(pane_target_for_session test-session)" == '%42' ]] || fail "should discover tmux pane IDs without assuming window 0"
+[[ "$(pane_target_for_session test-session '%42')" == '%42' ]] || fail "should preserve a valid recorded pane ID"
+if pane_target_for_session test-session 'test-session:0.0' | grep -q '0.0'; then
+  fail "should replace invalid legacy pane targets"
+fi
+
 trust_plus_banner_no_composer='
 > You are in /tmp/project
 

@@ -289,6 +289,17 @@ session_exists() {
   tmux has-session -t "$1" 2>/dev/null
 }
 
+pane_target_for_session() {
+  local session="$1" preferred_pane="${2:-}" pane
+  if [[ -n "$preferred_pane" ]] && tmux display-message -p -t "$preferred_pane" '#{pane_id}' >/dev/null 2>&1; then
+    printf '%s\n' "$preferred_pane"
+    return 0
+  fi
+  pane="$(tmux list-panes -t "$session" -F '#{pane_id}' 2>/dev/null | sed -n '1p')"
+  [[ -n "$pane" ]] || return 1
+  printf '%s\n' "$pane"
+}
+
 state_file_for() {
   local provider="$1" project_slug="$2" key_id="$3"
   printf '%s/%s/%s/%s.json\n' "$STATE_ROOT" "$provider" "$project_slug" "$key_id"
@@ -849,7 +860,7 @@ cmd_send() {
   key="${key:-$task}"
   key_id="$(key_id_from_key "$key")"
   session="ask-tmux-${provider}-${project_slug}-${key_id}"
-  pane="${session}:0.0"
+  pane=""
   state_file="$(state_file_for "$provider" "$project_slug" "$key_id")"
   lock_file="${state_file}.lock"
   run_stamp="$(date +%Y%m%dT%H%M%S)-$$-$RANDOM"
@@ -889,14 +900,17 @@ cmd_send() {
     old_busy="$(read_json_bool "$state_file" busy)"
     old_session="$(read_json_field "$state_file" session_name)"
     old_pane="$(read_json_field "$state_file" pane_target)"
+    if [[ -n "$old_session" ]] && session_exists "$old_session"; then
+      old_pane="$(pane_target_for_session "$old_session" "$old_pane" || true)"
+    fi
     old_sentinel="$(read_json_field "$state_file" done_sentinel)"
     old_response="$(read_json_field "$state_file" last_response)"
     old_started="$(read_json_number "$state_file" started_epoch)"
     old_key="$(read_json_field "$state_file" key)"
     [[ -n "$old_key" ]] || old_key="$key"
     if [[ "$old_busy" == "true" && -n "$old_session" && -n "$old_sentinel" ]] && session_exists "$old_session"; then
-      if printf '%s' "$(capture_pane_text "${old_pane:-${old_session}:0.0}" 240)" | rg -Fq "$old_sentinel" && response_file_is_fresh "$old_response" "${old_started:-0}"; then
-        write_state "$state_file" "$provider" "$old_key" "$project_slug" "$old_session" "${old_pane:-${old_session}:0.0}" "$resolved" "$(read_json_field "$state_file" last_packet)" "live" "$(read_json_field "$state_file" release_policy)" "$(read_json_field "$state_file" ttl)" "$old_response" "false" "${old_started:-$(date +%s)}" "$(date +%s)" "$old_sentinel"
+      if [[ -n "$old_pane" ]] && printf '%s' "$(capture_pane_text "$old_pane" 240)" | rg -Fq "$old_sentinel" && response_file_is_fresh "$old_response" "${old_started:-0}"; then
+        write_state "$state_file" "$provider" "$old_key" "$project_slug" "$old_session" "$old_pane" "$resolved" "$(read_json_field "$state_file" last_packet)" "live" "$(read_json_field "$state_file" release_policy)" "$(read_json_field "$state_file" ttl)" "$old_response" "false" "${old_started:-$(date +%s)}" "$(date +%s)" "$old_sentinel"
       else
         now_epoch="$(date +%s)"
         if [[ -n "$old_started" ]] && (( now_epoch - old_started > wait_timeout )); then
@@ -927,6 +941,8 @@ cmd_send() {
     tmux new-session -d -s "$session" -c "$resolved" "$launch_cmd" 9>&-
     log_event "launch" "$provider" "$session" "live" "$launch_cmd"
   fi
+  pane="$(pane_target_for_session "$session" || true)"
+  [[ -n "$pane" ]] || die "consultant session has no addressable pane: $session"
 
   local ready_status=0
   if wait_for_ready "$provider" "$stub" "$pane" "$ready_timeout" "$auto_trust"; then
@@ -1036,8 +1052,9 @@ cmd_status() {
     started="$(read_json_number "$file" started_epoch)"
     last="$(read_json_number "$file" last_used_epoch)"
     if [[ -n "$session" ]] && session_exists "$session"; then
+      pane="$(pane_target_for_session "$session" "$pane" || true)"
       if [[ "$busy" == "true" ]]; then
-        if [[ -n "$sentinel" && -n "$response" ]] && printf '%s' "$(capture_pane_text "${pane:-${session}:0.0}" 240)" | rg -Fq "$sentinel" && response_file_is_fresh "$response" "${started:-0}"; then
+        if [[ -n "$pane" && -n "$sentinel" && -n "$response" ]] && printf '%s' "$(capture_pane_text "$pane" 240)" | rg -Fq "$sentinel" && response_file_is_fresh "$response" "${started:-0}"; then
           local provider_name key_name project_slug cwd release_policy ttl now_epoch
           provider_name="$(read_json_field "$file" provider)"
           key_name="$(read_json_field "$file" key)"
@@ -1049,7 +1066,7 @@ cmd_status() {
           now_epoch="$(date +%s)"
           exec 9>"${file}.lock"
           if flock -w 2 9; then
-            write_state "$file" "${provider_name:-$provider}" "$key_name" "${project_slug:-unknown}" "$session" "${pane:-${session}:0.0}" "${cwd:-$PWD}" "$packet" "live" "${release_policy:-manual}" "$ttl" "$response" "false" "${started:-$now_epoch}" "$now_epoch" "$sentinel"
+            write_state "$file" "${provider_name:-$provider}" "$key_name" "${project_slug:-unknown}" "$session" "$pane" "${cwd:-$PWD}" "$packet" "live" "${release_policy:-manual}" "$ttl" "$response" "false" "${started:-$now_epoch}" "$now_epoch" "$sentinel"
             flock -u 9 || true
             busy="false"
             completed="$now_epoch"
@@ -1079,7 +1096,7 @@ cmd_status() {
         now_epoch="$(date +%s)"
         exec 9>"${file}.lock"
         if flock -w 2 9; then
-          write_state "$file" "${provider_name:-$provider}" "$key_name" "${project_slug:-unknown}" "$session" "${pane:-${session}:0.0}" "${cwd:-$PWD}" "$packet" "missing" "${release_policy:-manual}" "$ttl" "$response" "false" "${started:-$now_epoch}" "" "$sentinel"
+          write_state "$file" "${provider_name:-$provider}" "$key_name" "${project_slug:-unknown}" "$session" "${pane:-}" "${cwd:-$PWD}" "$packet" "missing" "${release_policy:-manual}" "$ttl" "$response" "false" "${started:-$now_epoch}" "" "$sentinel"
           flock -u 9 || true
           busy="false"
           last="$now_epoch"
@@ -1158,7 +1175,7 @@ cmd_release() {
     esac
   done
   [[ "$all" == "true" || -n "$key" ]] || die "release requires --key or --all"
-  local project_filter preferred files=() file session packet state_cwd project_slug response sentinel key_name provider_name release_policy ttl started
+  local project_filter preferred files=() file session pane packet state_cwd project_slug response sentinel key_name provider_name release_policy ttl started
   project_filter="$(project_slug_for_optional_cwd "$cwd" "$cwd_mode")"
   if [[ "$all" == "true" ]]; then
     read_state_files_into_array files "$provider" "" true "$project_filter"
@@ -1181,6 +1198,7 @@ cmd_release() {
     exec 9>"${file}.lock"
     flock -w 2 9 || die "state is locked by another ask-tmux operation: ${file}.lock"
     session="$(read_json_field "$file" session_name)"
+    pane="$(read_json_field "$file" pane_target)"
     packet="$(read_json_field "$file" last_packet)"
     state_cwd="$(read_json_field "$file" cwd)"
     project_slug="$(read_json_field "$file" project_slug)"
@@ -1195,7 +1213,7 @@ cmd_release() {
     if [[ -n "$session" ]]; then
       tmux kill-session -t "$session" 2>/dev/null || true
       info "released session=$session"
-      write_state "$file" "$provider_name" "$key_name" "${project_slug:-unknown}" "$session" "${session}:0.0" "${state_cwd:-$PWD}" "$packet" "released" "${release_policy:-manual}" "$ttl" "$response" "false" "${started:-$(date +%s)}" "$(date +%s)" "$sentinel"
+      write_state "$file" "$provider_name" "$key_name" "${project_slug:-unknown}" "$session" "$pane" "${state_cwd:-$PWD}" "$packet" "released" "${release_policy:-manual}" "$ttl" "$response" "false" "${started:-$(date +%s)}" "$(date +%s)" "$sentinel"
       log_event "release" "$provider_name" "$session" "released" "$file"
     fi
     flock -u 9 || true
@@ -1203,7 +1221,7 @@ cmd_release() {
 }
 
 cmd_cleanup() {
-  local provider="" stale_after="24h" now cutoff file last session packet cwd project_slug key_name busy
+  local provider="" stale_after="24h" now cutoff file last session pane packet cwd project_slug key_name busy
   provider="$(invoked_provider)"
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1222,6 +1240,7 @@ cmd_cleanup() {
       flock -w 2 9 || die "state is locked by another ask-tmux operation: ${file}.lock"
       busy="$(read_json_bool "$file" busy)"
       session="$(read_json_field "$file" session_name)"
+      pane="$(read_json_field "$file" pane_target)"
       packet="$(read_json_field "$file" last_packet)"
       cwd="$(read_json_field "$file" cwd)"
       project_slug="$(read_json_field "$file" project_slug)"
@@ -1238,7 +1257,7 @@ cmd_cleanup() {
         continue
       fi
       tmux kill-session -t "$session" 2>/dev/null || true
-      write_state "$file" "$provider_name" "$key_name" "${project_slug:-unknown}" "$session" "${session}:0.0" "${cwd:-$PWD}" "$packet" "released" "ttl" "$stale_after" "$response" "false" "${started:-$(date +%s)}" "$(date +%s)" "$sentinel"
+      write_state "$file" "$provider_name" "$key_name" "${project_slug:-unknown}" "$session" "$pane" "${cwd:-$PWD}" "$packet" "released" "ttl" "$stale_after" "$response" "false" "${started:-$(date +%s)}" "$(date +%s)" "$sentinel"
       log_event "cleanup" "$provider_name" "$session" "released" "$file"
       info "cleaned stale session=$session"
       flock -u 9 || true
