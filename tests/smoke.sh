@@ -33,6 +33,13 @@ if ! command -v rg >/dev/null 2>&1; then
   }
 fi
 
+gateway_timeout_kind="$(
+  bash -c 'source "$1"; transport_failure_kind "$2"' _ \
+    "$ROOT/bin/ask-tmux-pipeline" \
+    'ERROR: Claude provider gateway returned API Error 524 before completion.'
+)"
+[[ "$gateway_timeout_kind" == "provider_gateway_timeout_524" ]]
+
 cleanup() {
   rm -rf "$TMPDIR"
   while IFS= read -r state_file; do
@@ -144,7 +151,7 @@ printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
   '[[ "${1:-}" == "send" ]] || exit 96' \
-  'printf "raw:%s|audit=%s\n" "$*" "${ASK_TMUX_LOG_PATH:-$HOME/.omx/consultants/log.jsonl}" >> "$PIPELINE_RAW_LOG"' \
+  'printf "raw:%s|launcher=%s|audit=%s\n" "$*" "${ASK_TMUX_CLAUDE_LAUNCHER:-}" "${ASK_TMUX_LOG_PATH:-$HOME/.omx/consultants/log.jsonl}" >> "$PIPELINE_RAW_LOG"' \
   'cwd=""; shift' \
   'while [[ $# -gt 0 ]]; do case "$1" in --cwd) cwd="$2"; shift 2 ;; --cwd=*) cwd="${1#*=}"; shift ;; *) shift ;; esac; done' \
   '[[ -n "$cwd" ]] || exit 96' \
@@ -184,7 +191,39 @@ if invalid_gate_out="$(ASK_TMUX_CLAUDE_GATED_BIN="$TMPDIR/missing-gated-wrapper"
 fi
 printf '%s\n' "$invalid_gate_out" | rg -q 'configured ask-tmux-claude-gated is not installed or executable'
 
-start_out="$("${pipeline_gate_env[@]}" "$ROOT/bin/ask-tmux-claude-pipeline" start \
+if deepseek_model_out="$(ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek \
+  "${pipeline_gate_env[@]}" "$ROOT/bin/ask-tmux-claude-pipeline" start \
+    --model claude-opus-5 \
+    --dry-run \
+    --cwd-mode current \
+    --cwd "$TMPDIR" \
+    --prompt "DeepSeek must reject Claude model pins" 2>&1)"; then
+  printf 'DeepSeek pipeline should reject an explicit Claude model pin\n' >&2
+  exit 1
+else
+  deepseek_model_rc=$?
+fi
+[[ "$deepseek_model_rc" == "2" ]]
+printf '%s\n' "$deepseek_model_out" | rg -q -- '--model and --effort are not supported with cc-deepseek'
+
+if deepseek_effort_out="$(ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek \
+  "${pipeline_gate_env[@]}" "$ROOT/bin/ask-tmux-claude-pipeline" start \
+    --effort high \
+    --dry-run \
+    --cwd-mode current \
+    --cwd "$TMPDIR" \
+    --prompt "DeepSeek must retain its provider-owned effort" 2>&1)"; then
+  printf 'DeepSeek pipeline should reject an explicit Claude effort\n' >&2
+  exit 1
+else
+  deepseek_effort_rc=$?
+fi
+[[ "$deepseek_effort_rc" == "2" ]]
+printf '%s\n' "$deepseek_effort_out" | rg -q -- '--model and --effort are not supported with cc-deepseek'
+
+start_out="$(ASK_TMUX_CLAUDE_LAUNCHER=cc-claude \
+  "${pipeline_gate_env[@]}" "$ROOT/bin/ask-tmux-claude-pipeline" start \
+  --model claude-opus-5 \
   --stub \
   --stub-status needs-input \
   --stub-question "Smoke question?" \
@@ -204,7 +243,8 @@ printf '%s\n' "$start_out" | rg -q '^PIPELINE_STATUS=waiting_for_user$'
 pipeline_id="$(printf '%s\n' "$start_out" | sed -n 's/^pipeline_id=//p' | tail -1)"
 [[ -n "$pipeline_id" ]]
 
-answer_out="$("${pipeline_gate_env[@]}" "$ROOT/bin/ask-tmux-claude-pipeline" answer \
+answer_out="$(ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek \
+  "${pipeline_gate_env[@]}" "$ROOT/bin/ask-tmux-claude-pipeline" answer \
   --stub \
   --release now \
   --cwd-mode current \
@@ -218,18 +258,26 @@ final_context="$(printf '%s\n' "$answer_out" | sed -n 's/^final_context=//p' | t
 rg -q 'Smoke prompt' "$final_context"
 rg -q 'Smoke question' "$final_context"
 
-review_out="$("${pipeline_gate_env[@]}" "$ROOT/bin/ask-tmux-claude-pipeline" review \
+review_out="$(ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek \
+  "${pipeline_gate_env[@]}" "$ROOT/bin/ask-tmux-claude-pipeline" review \
   --stub \
   --release now \
   --cwd-mode current \
   --cwd "$TMPDIR" \
   --pipeline-id "$pipeline_id" \
-  --draft "Smoke owner draft." 2>&1)"
+  --draft "Smoke owner draft." 2>&1)" && review_rc=0 || review_rc=$?
+if [[ "$review_rc" != "0" ]]; then
+  printf '%s\n' "$review_out" >&2
+fi
+[[ "$review_rc" == "0" ]]
 printf '%s\n' "$review_out" | rg -q '^PIPELINE_STATUS=ready_for_synthesis$'
 review_context="$(printf '%s\n' "$review_out" | sed -n 's/^final_context=//p' | tail -1)"
 [[ -f "$review_context" ]]
 rg -q 'Smoke owner draft' "$review_context"
 [[ "$(grep -c '^raw:send ' "$raw_log")" == "3" ]]
+[[ "$(grep -c -- '--model claude-opus-5' "$raw_log")" == "3" ]]
+[[ "$(grep -c -- '--effort high' "$raw_log")" == "3" ]]
+[[ "$(grep -c '|launcher=cc-claude|' "$raw_log")" == "3" ]]
 [[ ! -e "$raw_trap_log" ]]
 main_audit="$gate_home/.omx/consultants/log.jsonl"
 continuation_audit="$gate_home/.omx/consultants/continuations.jsonl"

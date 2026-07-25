@@ -10,10 +10,21 @@ Use the current machine's local `ask-tmux-claude-gated` wrapper for Claude consu
 
 ## Provider Selection and Explicit Dual Review
 
-The default launcher is `cc-claude`; use
+The default launcher is `cc-claude`, which owns the Claude-provider model
+mapping (`claude-opus-5` on the aligned Mac and HPC installs). Use
 `ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek` for an explicitly requested DeepSeek
-review. Only those two launcher values are accepted and the runner preflights
-encrypted credentials before detaching tmux.
+review; that launcher owns its separate DeepSeek main/subagent mapping. Never
+export a shared `ANTHROPIC_MODEL`. Only those two launcher values are accepted
+and the runner preflights encrypted credentials before detaching tmux. Use
+`--model claude-opus-5` only with `cc-claude`; it is rejected with
+`cc-deepseek`. `--effort low|medium|high|xhigh|max` is likewise Claude-only.
+Claude defaults to `high`; DeepSeek retains its provider-owned `max` effort.
+
+`API Error: 524` means the configured provider gateway reached its 120-second
+origin-response limit. Increasing the ask-tmux `--wait-timeout` cannot extend
+that upstream deadline. The runner should fail the request promptly. Retry
+once only after splitting the task, requesting a concise response, or lowering
+`--effort`; do not silently change the model or provider.
 
 For an explicitly requested dual review, use `ask-tmux-claude-dual send` with
 `--gate-reason explicit_user_request`. It concurrently runs isolated,

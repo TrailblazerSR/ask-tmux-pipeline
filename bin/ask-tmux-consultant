@@ -58,6 +58,7 @@ LOG_PATH="${ASK_TMUX_LOG_PATH:-$HOME/.omx/consultants/log.jsonl}"
 PACKET_LIMIT_BYTES="${ASK_TMUX_PACKET_LIMIT_BYTES:-65536}"
 READY_TIMEOUT_SECONDS="${ASK_TMUX_READY_TIMEOUT_SECONDS:-45}"
 WAIT_TIMEOUT_SECONDS="${ASK_TMUX_WAIT_TIMEOUT_SECONDS:-600}"
+DEFAULT_CLAUDE_EFFORT="${ASK_TMUX_CLAUDE_EFFORT:-high}"
 
 usage() {
   cat <<'USAGE'
@@ -75,6 +76,8 @@ Commands:
 
 Common options:
   --provider claude|codex
+  --model MODEL             Optional Claude model pin. Supported only with cc-claude.
+  --effort LEVEL            Optional Claude effort: low, medium, high, xhigh, or max.
   --key NAME
   --cwd PATH
   --cwd-mode project|parent|git|current
@@ -306,8 +309,13 @@ state_file_for() {
 }
 
 write_state() {
-  local file="$1" provider="$2" key="$3" project_slug="$4" session="$5" pane="$6" cwd="$7" packet="$8" status="$9" release_policy="${10}" ttl="${11:-}" response_path="${12:-}" busy="${13:-false}" started_epoch="${14:-}" completed_epoch="${15:-}" done_sentinel="${16:-}"
+  local file="$1" provider="$2" key="$3" project_slug="$4" session="$5" pane="$6" cwd="$7" packet="$8" status="$9" release_policy="${10}" ttl="${11:-}" response_path="${12:-}" busy="${13:-false}" started_epoch="${14:-}" completed_epoch="${15:-}" done_sentinel="${16:-}" requested_model="${17:-}" claude_launcher="${18:-}" claude_effort="${19:-}"
   local now epoch tmp completed_value
+  if [[ -f "$file" ]]; then
+    [[ $# -ge 17 ]] || requested_model="$(read_json_field "$file" requested_model)"
+    [[ $# -ge 18 ]] || claude_launcher="$(read_json_field "$file" claude_launcher)"
+    [[ $# -ge 19 ]] || claude_effort="$(read_json_field "$file" claude_effort)"
+  fi
   now="$(date -Is)"
   epoch="$(date +%s)"
   [[ -n "$started_epoch" ]] || started_epoch="$epoch"
@@ -331,6 +339,9 @@ write_state() {
     printf '  "last_packet": "%s",\n' "$(json_escape "$packet")"
     printf '  "last_response": "%s",\n' "$(json_escape "$response_path")"
     printf '  "done_sentinel": "%s",\n' "$(json_escape "$done_sentinel")"
+    printf '  "requested_model": "%s",\n' "$(json_escape "$requested_model")"
+    printf '  "claude_launcher": "%s",\n' "$(json_escape "$claude_launcher")"
+    printf '  "claude_effort": "%s",\n' "$(json_escape "$claude_effort")"
     printf '  "release_policy": "%s",\n' "$(json_escape "$release_policy")"
     printf '  "ttl": "%s",\n' "$(json_escape "$ttl")"
     printf '  "status": "%s",\n' "$(json_escape "$status")"
@@ -537,6 +548,26 @@ selected_claude_launcher() {
   command -v "$launcher"
 }
 
+validate_claude_model() {
+  case "$1" in
+    ""|opus|sonnet|claude-opus-5|claude-opus-4-8|claude-sonnet-5) return 0 ;;
+    *)
+      printf 'Unsupported Claude model: %s\n' "$1" >&2
+      return 1
+      ;;
+  esac
+}
+
+validate_claude_effort() {
+  case "$1" in
+    ""|low|medium|high|xhigh|max) return 0 ;;
+    *)
+      printf 'Unsupported Claude effort: %s\n' "$1" >&2
+      return 1
+      ;;
+  esac
+}
+
 preflight_claude_credentials() {
   local launcher
   [[ "$1" == "true" ]] && return
@@ -545,7 +576,13 @@ preflight_claude_credentials() {
 }
 
 provider_launch_command() {
-  local provider="$1" stub="$2" launch_env claude_launcher
+  local provider="$1" stub="$2" requested_model="${3:-}" requested_effort="${4:-}" launch_env claude_launcher launcher_name
+  if [[ -n "$requested_model" && "$provider" != "claude" ]]; then
+    die "--model is supported only for the Claude provider"
+  fi
+  if [[ -n "$requested_effort" && "$provider" != "claude" ]]; then
+    die "--effort is supported only for the Claude provider"
+  fi
   if [[ "$stub" == "true" ]]; then
     printf "%s" "bash -lc 'printf \"ASK_TMUX_STUB_READY\\n\"; while IFS= read -r line; do printf \"ASK_TMUX_STUB_RECEIVED:%s\\n\" \"\$line\"; response=\$(printf \"%s\" \"\$line\" | sed -n \"s/.*ASK_TMUX_RESPONSE=\\([^ ]*\\).*/\\1/p\"); sentinel=\$(printf \"%s\" \"\$line\" | sed -n \"s/.*ASK_TMUX_SENTINEL=\\([^ ]*\\).*/\\1/p\"); if [ -n \"\$response\" ]; then mkdir -p \"\$(dirname \"\$response\")\"; printf \"Stub consultant response for: %s\\n\" \"\$line\" > \"\$response\"; fi; if [ -n \"\$sentinel\" ]; then printf \"%s\\n\" \"\$sentinel\"; fi; done'"
     return
@@ -554,7 +591,16 @@ provider_launch_command() {
   case "$provider" in
     claude)
       claude_launcher="$(selected_claude_launcher)" || die 'Claude provider launcher selection failed'
-      printf '%s\n' "$launch_env bash -lc 'exec \"\$@\"' bash $(shell_quote "$claude_launcher") --dangerously-skip-permissions"
+      launcher_name="$(basename "$claude_launcher")"
+      if [[ -n "$requested_model" || -n "$requested_effort" ]]; then
+        [[ "$launcher_name" == "cc-claude" ]] || die "--model and --effort are not supported with cc-deepseek; DeepSeek owns its model mapping"
+        validate_claude_model "$requested_model" || die "Claude model validation failed"
+        validate_claude_effort "$requested_effort" || die "Claude effort validation failed"
+      fi
+      printf '%s' "$launch_env bash -lc 'exec \"\$@\"' bash $(shell_quote "$claude_launcher")"
+      [[ -n "$requested_model" ]] && printf ' --model %s' "$(shell_quote "$requested_model")"
+      [[ -n "$requested_effort" ]] && printf ' --effort %s' "$(shell_quote "$requested_effort")"
+      printf ' --dangerously-skip-permissions\n'
       ;;
     codex) printf '%s\n' "$launch_env codex --dangerously-bypass-approvals-and-sandbox" ;;
     *) die "unknown provider: $provider" ;;
@@ -795,16 +841,23 @@ wait_for_ready() {
 }
 
 wait_for_done() {
-  local pane="$1" sentinel="$2" response_path="$3" timeout="$4" min_response_epoch="${5:-0}"
-  local start now text saw_sentinel="false"
+  local pane="$1" sentinel="$2" response_path="$3" timeout="$4" min_response_epoch="${5:-0}" provider="${6:-}"
+  local start now text saw_sentinel="false" initial_gateway_524_count current_gateway_524_count
   start="$(date +%s)"
+  initial_gateway_524_count="$(capture_pane_text "$pane" 2000 | awk 'index($0, "⎿") && index($0, "API Error: 524") { count++ } END { print count + 0 }')"
   while true; do
     session_exists "${pane%%:*}" || return 1
-    text="$(capture_pane_text "$pane" 240)"
+    text="$(capture_pane_text "$pane" 2000)"
     if text_contains_sentinel "$text" "$sentinel"; then
       saw_sentinel="true"
       if response_file_is_fresh "$response_path" "$min_response_epoch"; then
         return 0
+      fi
+    fi
+    if [[ "$provider" == "claude" ]]; then
+      current_gateway_524_count="$(printf '%s' "$text" | awk 'index($0, "⎿") && index($0, "API Error: 524") { count++ } END { print count + 0 }')"
+      if (( current_gateway_524_count > initial_gateway_524_count )); then
+        return 4
       fi
     fi
     now="$(date +%s)"
@@ -817,12 +870,14 @@ wait_for_done() {
 }
 
 cmd_send() {
-  local provider="" key="" cwd="" cwd_mode="project" task="review" owner_prompt="" release_policy="manual" ttl="" fresh="false" replace="false" reuse="true" dry_run="false" stub="${ASK_TMUX_CONSULTANT_STUB:-false}" attach="false" wait="true" ready_timeout="$READY_TIMEOUT_SECONDS" wait_timeout="$WAIT_TIMEOUT_SECONDS" auto_trust="false"
+  local provider="" requested_model="" requested_effort="" claude_launcher="" key="" cwd="" cwd_mode="project" task="review" owner_prompt="" release_policy="manual" ttl="" fresh="false" replace="false" reuse="true" dry_run="false" stub="${ASK_TMUX_CONSULTANT_STUB:-false}" attach="false" wait="true" ready_timeout="$READY_TIMEOUT_SECONDS" wait_timeout="$WAIT_TIMEOUT_SECONDS" auto_trust="false"
   local materials=()
   provider="$(invoked_provider)"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --provider) provider="$2"; shift 2 ;;
+      --model) requested_model="$2"; shift 2 ;;
+      --effort) requested_effort="$2"; shift 2 ;;
       --key) key="$2"; shift 2 ;;
       --cwd) cwd="$2"; shift 2 ;;
       --cwd-mode) cwd_mode="$2"; shift 2 ;;
@@ -848,6 +903,24 @@ cmd_send() {
   done
   [[ -n "$provider" ]] || die "--provider is required when not using a provider wrapper"
   [[ "$provider" == "claude" || "$provider" == "codex" ]] || die "provider must be claude or codex"
+  if [[ -n "$requested_model" && "$provider" != "claude" ]]; then
+    die "--model is supported only for the Claude provider"
+  fi
+  if [[ -n "$requested_effort" && "$provider" != "claude" ]]; then
+    die "--effort is supported only for the Claude provider"
+  fi
+  if [[ "$provider" == "claude" ]]; then
+    local claude_launcher_path
+    claude_launcher_path="$(selected_claude_launcher)" || die 'Claude provider launcher selection failed'
+    claude_launcher="$(basename "$claude_launcher_path")"
+    if [[ "$claude_launcher" == "cc-claude" ]]; then
+      requested_effort="${requested_effort:-$DEFAULT_CLAUDE_EFFORT}"
+      validate_claude_model "$requested_model" || die "Claude model validation failed"
+      validate_claude_effort "$requested_effort" || die "Claude effort validation failed"
+    elif [[ -n "$requested_model" || -n "$requested_effort" ]]; then
+      die "--model and --effort are not supported with cc-deepseek; DeepSeek owns its model mapping"
+    fi
+  fi
   command -v tmux >/dev/null || die "tmux is required"
   owner_prompt="${owner_prompt:-$(template_prompt "$task")}"
 
@@ -872,7 +945,7 @@ cmd_send() {
   if [[ "$provider" == "claude" ]]; then
     preflight_claude_credentials "$stub"
   fi
-  launch_cmd="$(provider_launch_command "$provider" "$stub")"
+  launch_cmd="$(provider_launch_command "$provider" "$stub" "$requested_model" "$requested_effort")"
 
   if [[ "$dry_run" == "true" ]]; then
     info "DRY_RUN provider=$provider"
@@ -886,6 +959,9 @@ cmd_send() {
 	    info "DRY_RUN response=$response"
 	    info "DRY_RUN done_sentinel=$done_sentinel"
 	    info "DRY_RUN launch_command=$launch_cmd"
+	    info "DRY_RUN claude_launcher=$claude_launcher"
+	    info "DRY_RUN requested_model=$requested_model"
+	    info "DRY_RUN claude_effort=$requested_effort"
 	    info "DRY_RUN task=$task"
 	    info "DRY_RUN prompt=$owner_prompt"
 	    return
@@ -896,7 +972,7 @@ cmd_send() {
   flock -w 2 9 || die "state is locked by another ask-tmux operation: $lock_file"
 
   if [[ -f "$state_file" ]]; then
-    local old_busy old_session old_pane old_sentinel old_response old_started old_key now_epoch
+    local old_busy old_session old_pane old_sentinel old_response old_started old_key old_model old_launcher old_effort now_epoch
     old_busy="$(read_json_bool "$state_file" busy)"
     old_session="$(read_json_field "$state_file" session_name)"
     old_pane="$(read_json_field "$state_file" pane_target)"
@@ -908,9 +984,18 @@ cmd_send() {
     old_started="$(read_json_number "$state_file" started_epoch)"
     old_key="$(read_json_field "$state_file" key)"
     [[ -n "$old_key" ]] || old_key="$key"
+    old_model="$(read_json_field "$state_file" requested_model)"
+    old_launcher="$(read_json_field "$state_file" claude_launcher)"
+    old_effort="$(read_json_field "$state_file" claude_effort)"
+    if [[ -n "$old_session" ]] && session_exists "$old_session"; then
+      if [[ "$old_model" != "$requested_model" || "$old_launcher" != "$claude_launcher" || "$old_effort" != "$requested_effort" ]] &&
+         [[ "$fresh" != "true" || "$replace" != "true" ]]; then
+        die "live session launcher/model/effort differs from this request; use --fresh --replace"
+      fi
+    fi
     if [[ "$old_busy" == "true" && -n "$old_session" && -n "$old_sentinel" ]] && session_exists "$old_session"; then
       if [[ -n "$old_pane" ]] && printf '%s' "$(capture_pane_text "$old_pane" 240)" | rg -Fq "$old_sentinel" && response_file_is_fresh "$old_response" "${old_started:-0}"; then
-        write_state "$state_file" "$provider" "$old_key" "$project_slug" "$old_session" "$old_pane" "$resolved" "$(read_json_field "$state_file" last_packet)" "live" "$(read_json_field "$state_file" release_policy)" "$(read_json_field "$state_file" ttl)" "$old_response" "false" "${old_started:-$(date +%s)}" "$(date +%s)" "$old_sentinel"
+        write_state "$state_file" "$provider" "$old_key" "$project_slug" "$old_session" "$old_pane" "$resolved" "$(read_json_field "$state_file" last_packet)" "live" "$(read_json_field "$state_file" release_policy)" "$(read_json_field "$state_file" ttl)" "$old_response" "false" "${old_started:-$(date +%s)}" "$(date +%s)" "$old_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
       else
         now_epoch="$(date +%s)"
         if [[ -n "$old_started" ]] && (( now_epoch - old_started > wait_timeout )); then
@@ -949,7 +1034,7 @@ cmd_send() {
     ready_status=0
   else
     ready_status="$?"
-    write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$(date +%s)" "" "$done_sentinel"
+    write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$(date +%s)" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
     log_event "ready_timeout" "$provider" "$session" "failed" "exit=$ready_status"
     die "consultant did not become ready; inspect with: tmux attach -t $session"
   fi
@@ -957,7 +1042,7 @@ cmd_send() {
   local send_epoch
   send_epoch="$(date +%s)"
   rm -f "$response"
-  write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "live" "$release_policy" "$ttl" "$response" "true" "$send_epoch" "" "$done_sentinel"
+  write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "live" "$release_policy" "$ttl" "$response" "true" "$send_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
   short_prompt="ASK_TMUX_RESPONSE=$response ASK_TMUX_SENTINEL=$done_sentinel Read and follow this review packet: $packet . Task: $owner_prompt . When complete, write your full response to the ASK_TMUX_RESPONSE path and print only the ASK_TMUX_SENTINEL value on its own final line."
   send_prompt_to_pane "$pane" "$short_prompt" "$provider" "ASK_TMUX_RESPONSE=$response"
   log_event "send" "$provider" "$session" "sent" "$packet"
@@ -970,8 +1055,8 @@ cmd_send() {
 
   if [[ "$wait" == "true" ]]; then
     local done_rc
-    if wait_for_done "$pane" "$done_sentinel" "$response" "$wait_timeout" "$send_epoch"; then
-      write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "live" "$release_policy" "$ttl" "$response" "false" "$(date +%s)" "$(date +%s)" "$done_sentinel"
+    if wait_for_done "$pane" "$done_sentinel" "$response" "$wait_timeout" "$send_epoch" "$provider"; then
+      write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "live" "$release_policy" "$ttl" "$response" "false" "$send_epoch" "$(date +%s)" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
       log_event "done" "$provider" "$session" "complete" "$response"
       info "done_sentinel=$done_sentinel"
       info "response_file=$response"
@@ -981,19 +1066,24 @@ cmd_send() {
       done_rc="$?"
       case "$done_rc" in
         1)
-          write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$(date +%s)" "" "$done_sentinel"
+          write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$send_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
           log_event "session_exited" "$provider" "$session" "failed" "$response"
           die "consultant session exited before done sentinel"
           ;;
         2)
-          write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "live" "$release_policy" "$ttl" "$response" "true" "$(date +%s)" "" "$done_sentinel"
+          write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "live" "$release_policy" "$ttl" "$response" "true" "$send_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
           log_event "wait_timeout" "$provider" "$session" "busy" "$response"
           die "timed out waiting ${wait_timeout}s for done sentinel; inspect with capture/attach"
           ;;
         3)
-          write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$(date +%s)" "" "$done_sentinel"
+          write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$send_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
           log_event "missing_response" "$provider" "$session" "failed" "$response"
           die "done sentinel appeared but response file is missing: $response"
+          ;;
+        4)
+          write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$send_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
+          log_event "provider_gateway_timeout_524" "$provider" "$session" "failed" "$response"
+          die "Claude provider gateway returned API Error 524 before completion. The gateway's 120-second origin timeout is shorter than this request's model latency; increasing --wait-timeout will not help. Split the task, request a concise response, lower Claude effort, or use a provider route with a longer streaming timeout."
           ;;
         *)
           die "unexpected wait failure: $done_rc"
@@ -1008,7 +1098,7 @@ cmd_send() {
   case "$release_policy" in
     now)
       tmux kill-session -t "$session" 2>/dev/null || true
-      write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "released" "$release_policy" "$ttl" "$response" "false" "$(date +%s)" "$(date +%s)" "$done_sentinel"
+      write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "released" "$release_policy" "$ttl" "$response" "false" "$send_epoch" "$(date +%s)" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
       log_event "release_now" "$provider" "$session" "released" "$state_file"
       info "released session=$session"
       ;;

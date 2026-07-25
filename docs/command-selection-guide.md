@@ -1,6 +1,8 @@
 # Tmux Pipeline Command Selection Guide
 
-Draft for Claude review.
+This guide answers which command family to use. For the canonical provider,
+model, effort, and continuation contract, see
+[Ask-Tmux Invocation Grammar](invocation-grammar.md).
 
 ## Primary Decision
 
@@ -30,6 +32,13 @@ For an explicitly requested dual-provider review, use
 `ask-tmux-claude-dual send` with the same arguments. It runs isolated gated
 `cc-claude` and `cc-deepseek` lanes concurrently, labels both results, and
 costs two provider requests. Do not use it for automatic pipeline traffic.
+The aligned Mac and HPC `cc-claude` launchers pin `claude-opus-5`; `cc-deepseek`
+retains its own DeepSeek main/subagent mapping. Keep model selection inside
+each launcher rather than exporting a shared `ANTHROPIC_MODEL`. An explicit
+Claude pin may use `--model claude-opus-5`; the command rejects that option
+with `cc-deepseek`. Claude pipelines default to `high` effort; DeepSeek retains
+its provider-owned `max` effort. Pipelines preserve their initial
+launcher/model/effort tuple across continuations.
 
 ### 2. Simple Codex Review
 

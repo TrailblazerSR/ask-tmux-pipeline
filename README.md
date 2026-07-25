@@ -88,6 +88,26 @@ ask-tmux-claude-dual send \
   --wait
 ```
 
+`cc-claude` should pin the Anthropic main-session model process-locally
+(`claude-opus-5` on the aligned Mac and HPC installations). `cc-deepseek` independently
+pins its DeepSeek main and subagent models. The ask-tmux commands select one
+launcher per lane and must not set a shared `ANTHROPIC_MODEL`; this preserves
+concurrent Claude and DeepSeek sessions. A one-off Claude-provider override can
+be supplied with `--model claude-opus-5` (or directly to the launcher with
+`CC_CLAUDE_MODEL=<provider-model-id>`). `--model` is rejected for
+`cc-deepseek`. Claude uses `high` effort by default; DeepSeek retains its
+provider-owned `max` effort. Pipelines persist the selected launcher, model,
+and effort across `answer` and `review` continuations.
+
+The runner treats Claude `API Error: 524`
+as a terminal provider failure instead of leaving the request busy until the
+local wait timeout. Raising `--wait-timeout` cannot extend a gateway's
+120-second origin-response limit. It records
+`provider_gateway_timeout_524` and does not automatically lower effort,
+switch providers, or retry the unchanged workload. Split the task or shorten
+the requested output; use a lower one-off `--effort` only when explicitly
+chosen.
+
 Send the same prompt to tmux Claude and synthesize the result in the owner CLI:
 
 ```bash
@@ -121,7 +141,9 @@ ask-tmux-claude-pipeline review \
   --draft "CURRENT CLI DRAFT"
 ```
 
-For more examples, see [docs/command-selection-guide.md](docs/command-selection-guide.md).
+For strict provider, effort, and continuation rules, see
+[docs/invocation-grammar.md](docs/invocation-grammar.md). For task-oriented
+examples, see [docs/command-selection-guide.md](docs/command-selection-guide.md).
 
 ## Flowcharts
 

@@ -22,12 +22,19 @@ One successful initial stage consumes one automatic-review budget slot. Follow-u
 
 ## Provider Selection and Dual Boundary
 
-Pipelines default to `cc-claude`; prefix an explicitly requested DeepSeek
-pipeline with `ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek`. Unlock encrypted
-credentials once interactively before a detached launch. `ask-tmux-claude-dual`
-is only for explicitly requested, one-off dual-provider review packets. Do not
-substitute it into the single-consultant pipeline continuation flow; preserve
-its two labelled outputs and synthesize them locally instead.
+Pipelines default to `cc-claude`, which owns the Claude-provider model mapping
+(`claude-opus-5` on the aligned Mac and HPC installs); prefix an explicitly requested
+DeepSeek pipeline with `ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek`, which owns its
+separate DeepSeek main/subagent mapping. Never export a shared
+`ANTHROPIC_MODEL` in the pipeline dispatcher. `--model claude-opus-5` is an
+optional Claude-only pin. Claude pipelines use `high` effort by default and
+accept a Claude-only `--effort` override. Both options are rejected with
+`cc-deepseek`, which retains its provider-owned `max` effort. The initial
+launcher/model/effort tuple is retained for every continuation. Unlock encrypted credentials once
+interactively before a detached launch. `ask-tmux-claude-dual` is only for
+explicitly requested, one-off dual-provider review packets. Do not substitute
+it into the single-consultant pipeline continuation flow; preserve its two
+labelled outputs and synthesize them locally instead.
 
 ## Modes
 
@@ -91,6 +98,11 @@ Important markers:
 - `PIPELINE_STATUS=waiting_for_user`: ask the printed question and wait.
 - `PIPELINE_STATUS=blocked`: report the blocker and relevant artifact path.
 - Exit code `30`: the underlying tmux consultant transport failed; inspect the printed output artifact or retry after checking `status`/`capture`.
+
+The pipeline classifies Claude `API Error: 524` as
+`provider_gateway_timeout_524`. Do not automatically lower effort, switch
+providers, or retry the unchanged workload. Keep the default `high` unless the
+user explicitly chooses a smaller task or a lower one-off effort.
 
 Use `status`, `resume`, and `final-context` with `--pipeline-id` when recovering a pipeline. Treat `~/.omx/state/tmux-pipelines/current.json` as advisory only; if more than one pipeline may exist, use explicit `--pipeline-id` and `--cwd`.
 

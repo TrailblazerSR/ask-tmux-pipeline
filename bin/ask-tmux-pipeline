@@ -51,9 +51,10 @@ if ! command -v rg >/dev/null 2>&1; then
   }
 fi
 
-VERSION="0.1.0"
+VERSION="0.2.0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 CLAUDE_PIPELINE_GATE_REASON="external_review_required"
+DEFAULT_CLAUDE_EFFORT="${ASK_TMUX_CLAUDE_EFFORT:-high}"
 
 default_base_runner() {
   if [[ -x "$SCRIPT_DIR/ask-tmux-consultant" ]]; then
@@ -84,6 +85,8 @@ Commands:
 
 Common options:
   --provider claude|codex
+  --model MODEL                           Optional Claude model pin; cc-claude only
+  --effort LEVEL                          Claude effort; cc-claude only, default: high
   --mode synthesize|mirror|pure|review     Default: synthesize; pure is mirror
   --pipeline-id ID
   --key KEY                              Consultant key override
@@ -209,6 +212,28 @@ provider_wrapper() {
         return 127
       fi
       ;;
+  esac
+}
+
+selected_claude_launcher() {
+  local launcher="${ASK_TMUX_CLAUDE_LAUNCHER:-cc-claude}"
+  case "$launcher" in
+    cc-claude|cc-deepseek) printf '%s\n' "$launcher" ;;
+    *) die 2 "ASK_TMUX_CLAUDE_LAUNCHER must be cc-claude or cc-deepseek (got: $launcher)" ;;
+  esac
+}
+
+validate_claude_model() {
+  case "$1" in
+    ""|opus|sonnet|claude-opus-5|claude-opus-4-8|claude-sonnet-5) return 0 ;;
+    *) die 2 "unsupported Claude model: $1" ;;
+  esac
+}
+
+validate_claude_effort() {
+  case "$1" in
+    low|medium|high|xhigh|max) return 0 ;;
+    *) die 2 "unsupported Claude effort: $1" ;;
   esac
 }
 
@@ -610,24 +635,36 @@ Rules:
 EOF
 }
 
+transport_failure_kind() {
+  local output="$1"
+  if printf '%s\n' "$output" | rg -q 'API Error:?[[:space:]]+524'; then
+    printf '%s\n' 'provider_gateway_timeout_524'
+  else
+    printf '%s\n' 'consultant_transport_failed'
+  fi
+}
+
 run_consultant() {
   local provider="$1" mode="$2" stage="$3" cwd="$4" key="$5" release_policy="$6" stub="$7" stub_status="$8" stub_question="$9" stub_recommended="${10}" ready_timeout="${11}" wait_timeout="${12}" auto_trust="${13}" fresh="${14}" replace="${15}"
-  local gate_continuation="${16}"
-  shift 16
+  local claude_launcher="${16}" requested_model="${17}" requested_effort="${18}" gate_continuation="${19}"
+  shift 19
   local materials=("$@")
   local wrapper output_file response_file consultant_state output prompt
-  local gate_fingerprint gate_root_digest gate_content_digest transport_status
+  local gate_fingerprint gate_root_digest gate_content_digest transport_status transport_error_kind
   wrapper="$(provider_wrapper "$provider")"
   prompt="$(consultant_prompt "$mode" "$stage")"
   output_file="$PIPELINE_DIR/consultant-${stage}-$(date +%Y%m%dT%H%M%S)-$$.out"
 
-  local cmd
+  local cmd command_env=(env)
   if [[ "$provider" == "claude" ]]; then
     gate_fingerprint="$(read_json_field "$PIPELINE_STATE_FILE" gate_fingerprint)"
     gate_root_digest="$(read_json_field "$PIPELINE_STATE_FILE" gate_root_digest)"
     gate_content_digest="$(pipeline_content_digest "$stage" "${materials[@]+"${materials[@]}"}")"
     [[ -n "$gate_fingerprint" ]] || die 30 "Claude pipeline is missing its stable gate fingerprint"
     cmd=("$wrapper" send --gate-reason "$CLAUDE_PIPELINE_GATE_REASON" --gate-fingerprint "$gate_fingerprint" --gate-content-digest "$gate_content_digest" --key "$key" --cwd "$cwd" --cwd-mode current --task custom --prompt "$prompt" --wait --release "$release_policy" --ready-timeout "$ready_timeout" --wait-timeout "$wait_timeout")
+    command_env=(env "ASK_TMUX_CLAUDE_LAUNCHER=$claude_launcher")
+    [[ -n "$requested_model" ]] && cmd+=(--model "$requested_model")
+    [[ -n "$requested_effort" ]] && cmd+=(--effort "$requested_effort")
     if [[ "$stage" == "initial" ]]; then
       cmd+=(--gate-pipeline-start)
       state_set "$PIPELINE_STATE_FILE" "gate_root_digest=$gate_content_digest"
@@ -649,25 +686,26 @@ run_consultant() {
   done
 
   state_set "$PIPELINE_STATE_FILE" "status=waiting_for_consultant" "last_stage=$stage"
-  if output="$("${cmd[@]}" 2>&1)"; then
+  if output="$("${command_env[@]}" "${cmd[@]}" 2>&1)"; then
     transport_status=0
   else
     transport_status=$?
+    transport_error_kind="$(transport_failure_kind "$output")"
     printf '%s\n' "$output" > "$output_file"
     case "$stage" in
       followup)
-        state_set "$PIPELINE_STATE_FILE" "status=waiting_for_user" "blocked_reason=__DELETE__" "last_transport_error=consultant transport failed (exit $transport_status)" "last_consultant_output=$output_file"
+        state_set "$PIPELINE_STATE_FILE" "status=waiting_for_user" "blocked_reason=__DELETE__" "last_transport_error_kind=$transport_error_kind" "last_transport_error=consultant transport failed (exit $transport_status)" "last_consultant_output=$output_file"
         ;;
       review)
-        state_set "$PIPELINE_STATE_FILE" "status=ready_for_synthesis" "blocked_reason=__DELETE__" "last_transport_error=consultant transport failed (exit $transport_status)" "last_consultant_output=$output_file"
+        state_set "$PIPELINE_STATE_FILE" "status=ready_for_synthesis" "blocked_reason=__DELETE__" "last_transport_error_kind=$transport_error_kind" "last_transport_error=consultant transport failed (exit $transport_status)" "last_consultant_output=$output_file"
         ;;
       *)
-        state_set "$PIPELINE_STATE_FILE" "status=blocked" "blocked_reason=consultant transport failed (exit $transport_status)" "last_consultant_output=$output_file"
+        state_set "$PIPELINE_STATE_FILE" "status=blocked" "blocked_reason=$transport_error_kind (exit $transport_status)" "last_transport_error_kind=$transport_error_kind" "last_transport_error=consultant transport failed (exit $transport_status)" "last_consultant_output=$output_file"
         ;;
     esac
     copy_state_indexes "$PIPELINE_STATE_FILE" "$provider" "$PROJECT_SLUG" "$(read_json_field "$PIPELINE_STATE_FILE" pipeline_id)"
     printf '%s\n' "$output"
-    die 30 "tmux consultant transport failed; output=$output_file"
+    die 30 "tmux consultant transport failed ($transport_error_kind); output=$output_file"
   fi
   printf '%s\n' "$output" > "$output_file"
 
@@ -680,6 +718,7 @@ run_consultant() {
   state_set "$PIPELINE_STATE_FILE" \
     "latest_response_file=$response_file" \
     "last_consultant_output=$output_file" \
+    "last_transport_error_kind=__DELETE__" \
     "last_transport_error=__DELETE__" \
     "consultant_state_file=$consultant_state"
   printf '%s\n' "$response_file"
@@ -882,13 +921,15 @@ load_state_context() {
 }
 
 cmd_start() {
-  local provider mode key="" pipeline_id="" cwd="" cwd_mode="project" prompt="" prompt_file="" release_policy="manual" stub="false" stub_status="" stub_question="" stub_recommended="" ready_timeout="45" wait_timeout="600" auto_trust="false" dry_run="false" fresh="false" replace="false"
+  local provider mode requested_model="" requested_effort="" claude_launcher="" key="" pipeline_id="" cwd="" cwd_mode="project" prompt="" prompt_file="" release_policy="manual" stub="false" stub_status="" stub_question="" stub_recommended="" ready_timeout="45" wait_timeout="600" auto_trust="false" dry_run="false" fresh="false" replace="false"
   local materials=()
   provider="$(invoked_provider)"
   mode="$(invoked_mode)"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --provider) provider="$2"; shift 2 ;;
+      --model) requested_model="$2"; shift 2 ;;
+      --effort) requested_effort="$2"; shift 2 ;;
       --mode) mode="$2"; shift 2 ;;
       --pipeline-id) pipeline_id="$2"; shift 2 ;;
       --key) key="$2"; shift 2 ;;
@@ -914,6 +955,18 @@ cmd_start() {
   done
   [[ -n "$provider" ]] || die 2 "--provider is required"
   [[ "$provider" == "claude" || "$provider" == "codex" ]] || die 2 "provider must be claude or codex"
+  if [[ "$provider" == "claude" ]]; then
+    claude_launcher="$(selected_claude_launcher)"
+    validate_claude_model "$requested_model"
+    if [[ "$claude_launcher" == "cc-claude" ]]; then
+      requested_effort="${requested_effort:-$DEFAULT_CLAUDE_EFFORT}"
+      validate_claude_effort "$requested_effort"
+    elif [[ -n "$requested_model" || -n "$requested_effort" ]]; then
+      die 2 "--model and --effort are not supported with cc-deepseek; DeepSeek owns its model mapping"
+    fi
+  elif [[ -n "$requested_model" || -n "$requested_effort" ]]; then
+    die 2 "--model and --effort are supported only for the Claude provider"
+  fi
   mode="$(normalize_mode "$mode")"
   local prompt_text resolved prompt_path response_file review_requested
   prompt_text="$(read_text_arg "$prompt" "$prompt_file")" || die 2 "start requires --prompt or --prompt-file"
@@ -933,6 +986,9 @@ cmd_start() {
     info "DRY_RUN pipeline_id=$pipeline_id"
     info "DRY_RUN pipeline_dir=$PIPELINE_DIR"
     info "DRY_RUN consultant_key=$CONSULTANT_KEY"
+    info "DRY_RUN claude_launcher=$claude_launcher"
+    info "DRY_RUN requested_model=$requested_model"
+    info "DRY_RUN requested_effort=$requested_effort"
     return
   fi
 
@@ -948,6 +1004,9 @@ cmd_start() {
     "project_slug=$PROJECT_SLUG" \
     "pipeline_dir=$PIPELINE_DIR" \
     "consultant_key=$CONSULTANT_KEY" \
+    "claude_launcher=$claude_launcher" \
+    "requested_model=$requested_model" \
+    "requested_effort=$requested_effort" \
     "gate_fingerprint=pipeline:$pipeline_id" \
     "status=initializing" \
     "prompt_file=$prompt_path" \
@@ -957,7 +1016,7 @@ cmd_start() {
     "response_count=0"
 
   copy_state_indexes "$PIPELINE_STATE_FILE" "$provider" "$PROJECT_SLUG" "$pipeline_id"
-  response_file="$(run_consultant "$provider" "$mode" "initial" "$resolved" "$CONSULTANT_KEY" "$release_policy" "$stub" "$stub_status" "$stub_question" "$stub_recommended" "$ready_timeout" "$wait_timeout" "$auto_trust" "$fresh" "$replace" "" "$prompt_path" "${materials[@]+"${materials[@]}"}")"
+  response_file="$(run_consultant "$provider" "$mode" "initial" "$resolved" "$CONSULTANT_KEY" "$release_policy" "$stub" "$stub_status" "$stub_question" "$stub_recommended" "$ready_timeout" "$wait_timeout" "$auto_trust" "$fresh" "$replace" "$claude_launcher" "$requested_model" "$requested_effort" "" "$prompt_path" "${materials[@]+"${materials[@]}"}")"
   handle_response "$provider" "initial" "$response_file"
 }
 
@@ -984,7 +1043,7 @@ cmd_answer() {
     esac
   done
   [[ -n "$provider" ]] || die 2 "--provider is required"
-  local state_file status seq answer_text answer_path response_file prompt_file latest_response mode cwd_state
+  local state_file status seq answer_text answer_path response_file prompt_file latest_response mode cwd_state claude_launcher requested_model requested_effort
   if [[ -n "$pipeline_id" ]]; then
     state_file="$(find_state_by_id "$provider" "$pipeline_id" "$cwd" "$cwd_mode")"
   else
@@ -1010,7 +1069,10 @@ cmd_answer() {
   latest_response="$(read_json_field "$state_file" latest_pipeline_response)"
   mode="$(read_json_field "$state_file" mode)"
   cwd_state="$(read_json_field "$state_file" cwd)"
-  response_file="$(run_consultant "$provider" "$mode" "followup" "$cwd_state" "$CONSULTANT_KEY" "$release_policy" "$stub" "$stub_status" "$stub_question" "$stub_recommended" "$ready_timeout" "$wait_timeout" "$auto_trust" "false" "false" "answer:$seq" "$prompt_file" "$latest_response" "$answer_path")"
+  claude_launcher="$(read_json_field "$state_file" claude_launcher)"
+  requested_model="$(read_json_field "$state_file" requested_model)"
+  requested_effort="$(read_json_field "$state_file" requested_effort)"
+  response_file="$(run_consultant "$provider" "$mode" "followup" "$cwd_state" "$CONSULTANT_KEY" "$release_policy" "$stub" "$stub_status" "$stub_question" "$stub_recommended" "$ready_timeout" "$wait_timeout" "$auto_trust" "false" "false" "$claude_launcher" "$requested_model" "$requested_effort" "answer:$seq" "$prompt_file" "$latest_response" "$answer_path")"
   handle_response "$provider" "followup" "$response_file"
 }
 
@@ -1037,7 +1099,7 @@ cmd_review() {
     esac
   done
   [[ -n "$provider" ]] || die 2 "--provider is required"
-  local state_file status draft_text draft_path prompt_file latest_response mode cwd_state response_file review_seq
+  local state_file status draft_text draft_path prompt_file latest_response mode cwd_state response_file review_seq claude_launcher requested_model requested_effort
   if [[ -n "$pipeline_id" ]]; then
     state_file="$(find_state_by_id "$provider" "$pipeline_id" "$cwd" "$cwd_mode")"
   else
@@ -1059,7 +1121,10 @@ cmd_review() {
   latest_response="$(read_json_field "$state_file" latest_pipeline_response)"
   mode="$(read_json_field "$state_file" mode)"
   cwd_state="$(read_json_field "$state_file" cwd)"
-  response_file="$(run_consultant "$provider" "$mode" "review" "$cwd_state" "$CONSULTANT_KEY" "$release_policy" "$stub" "$stub_status" "$stub_question" "$stub_recommended" "$ready_timeout" "$wait_timeout" "$auto_trust" "false" "false" "review:$review_seq" "$prompt_file" "$latest_response" "$draft_path")"
+  claude_launcher="$(read_json_field "$state_file" claude_launcher)"
+  requested_model="$(read_json_field "$state_file" requested_model)"
+  requested_effort="$(read_json_field "$state_file" requested_effort)"
+  response_file="$(run_consultant "$provider" "$mode" "review" "$cwd_state" "$CONSULTANT_KEY" "$release_policy" "$stub" "$stub_status" "$stub_question" "$stub_recommended" "$ready_timeout" "$wait_timeout" "$auto_trust" "false" "false" "$claude_launcher" "$requested_model" "$requested_effort" "review:$review_seq" "$prompt_file" "$latest_response" "$draft_path")"
   state_set "$state_file" "review_seq=$review_seq"
   handle_response "$provider" "review" "$response_file"
 }
@@ -1094,11 +1159,15 @@ for key in [
     "mode",
     "cwd",
     "consultant_key",
+    "claude_launcher",
+    "requested_model",
+    "requested_effort",
     "pending_question_seq",
     "pending_question",
     "recommended_default",
     "latest_pipeline_response",
     "final_context_file",
+    "last_transport_error_kind",
     "blocked_reason",
 ]:
     value = state.get(key)
@@ -1159,6 +1228,10 @@ cmd_final_context() {
 cmd_doctor() {
   local failed=0 claude_gate
   info "ask-tmux-pipeline version=$VERSION"
+  case "$DEFAULT_CLAUDE_EFFORT" in
+    low|medium|high|xhigh|max) info "PASS default_claude_effort=$DEFAULT_CLAUDE_EFFORT" ;;
+    *) info "FAIL invalid_default_claude_effort=$DEFAULT_CLAUDE_EFFORT"; failed=1 ;;
+  esac
   if [[ -x "$BASE_RUNNER" ]]; then info "PASS base_runner=$BASE_RUNNER"; else info "FAIL base_runner_not_executable=$BASE_RUNNER"; failed=1; fi
   if command -v tmux >/dev/null; then info "PASS tmux=$(tmux -V)"; else info "FAIL tmux missing"; failed=1; fi
   if [[ "${ASK_TMUX_RG_FALLBACK:-}" == "grep" ]]; then info "PASS rg=fallback-grep"; elif command -v rg >/dev/null; then info "PASS rg=$(command -v rg)"; else info "FAIL rg missing"; failed=1; fi

@@ -36,10 +36,23 @@ the gate itself.
 
 ## Provider Selection
 
-`ask-tmux-claude` uses `cc-claude` by default. Select DeepSeek for one
-explicitly requested review with `ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek` before
-the command. Only `cc-claude` and `cc-deepseek` are accepted; the runner
-preflights encrypted credentials before detaching tmux.
+`ask-tmux-claude` uses `cc-claude` by default. That launcher owns the
+Claude-provider model mapping (`claude-opus-5` on the aligned Mac and HPC installs).
+Select DeepSeek for one explicitly requested review with
+`ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek` before the command; that launcher owns
+its separate DeepSeek main/subagent mapping. Never export a shared
+`ANTHROPIC_MODEL`. Only `cc-claude` and `cc-deepseek` are accepted; the runner
+preflights encrypted credentials before detaching tmux. `--model
+claude-opus-5` and `--effort low|medium|high|xhigh|max` are accepted only with
+`cc-claude`. Claude defaults to `high`; `cc-deepseek` retains its
+provider-owned `max` effort.
+
+If Claude reports `API Error: 524`, the provider gateway reached its
+120-second origin-response limit. Increasing `--wait-timeout` does not change
+that upstream limit. The runner should mark the request failed promptly.
+Retry once only after reducing the workload: split the review, request a more
+concise response, or select a lower `--effort`. Do not silently change models,
+providers, or reasoning quality.
 
 ## Explicit Dual Review
 
@@ -151,6 +164,8 @@ Use `--cwd` on `capture`, `attach`, and `release` whenever a generic key such as
 - `--cwd PATH`: project or stage root used to scope packets, state lookup, and lifecycle commands.
 - `--cwd-mode project|parent|git|current`: how to resolve `--cwd`; `current` respects explicit `--cwd` and otherwise uses the caller shell directory.
 - `--wait` / `--no-wait`: block for the response file or leave the session busy for later polling.
+- `--model MODEL`: pin a supported Claude model for a `cc-claude` session.
+- `--effort LEVEL`: set Claude effort to `low`, `medium`, `high`, `xhigh`, or `max`; lower effort can reduce gateway-timeout risk for bounded reviews.
 - `--ready-timeout SECONDS`: readiness wait.
 - `--wait-timeout SECONDS`: response wait.
 - `--auto-trust`: allow automatic confirmation of Claude workspace trust prompt.

@@ -14,10 +14,22 @@ Every Claude pipeline stage is automatic review traffic. The dispatcher must inv
 
 One successful initial stage consumes one automatic-review budget slot. Follow-up answers and draft reviews are allowed only as ordered continuations of the same project, consultant key, pipeline fingerprint, and content-digest grant. The grant has a fixed 24-hour lifetime and an eight-continuation cap; unrelated pipelines remain subject to the normal daily caps and 20-minute project cooldown.
 
-Pipelines default to `cc-claude`; prefix an explicitly requested DeepSeek
-pipeline with `ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek`. `ask-tmux-claude-dual`
-is an explicit one-off review wrapper, not a substitute for this
-single-consultant pipeline or its continuation grant.
+Pipelines default to `cc-claude`, which owns the Claude-provider model mapping
+(`claude-opus-5` on the aligned Mac and HPC installs); prefix an explicitly requested
+DeepSeek pipeline with `ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek`, which owns its
+separate DeepSeek main/subagent mapping. Never export a shared
+`ANTHROPIC_MODEL` in the pipeline dispatcher. `--model claude-opus-5` is an
+optional Claude-only pin. Claude pipelines default to `high` effort and accept
+a Claude-only `--effort` override. Both options are rejected with
+`cc-deepseek`, which retains its provider-owned `max` effort. The pipeline
+persists the initial launcher, model, and effort for every continuation.
+
+Claude `API Error: 524` is recorded as `provider_gateway_timeout_524`.
+Do not automatically lower effort, switch providers, or retry the unchanged
+workload.
+`ask-tmux-claude-dual` is an
+explicit one-off review wrapper, not a substitute for this single-consultant
+pipeline or its continuation grant.
 
 ## Modes
 

@@ -155,6 +155,38 @@ assert_not_ready codex "$trust_plus_banner_no_composer"
 assert_ready codex "$ready_with_stale_trust"
 assert_ready claude "$claude_ready_with_status"
 text_contains_sentinel "$wrapped_sentinel" "$sentinel" || fail "wrapped sentinel was not detected"
+
+original_session_exists="$(declare -f session_exists)"
+original_capture_pane_text="$(declare -f capture_pane_text)"
+provider_timeout_fixture="$(mktemp /tmp/ask-tmux-provider-timeout.XXXXXX)"
+rm -f "$provider_timeout_fixture"
+session_exists() { return 0; }
+capture_pane_text() {
+  if [[ -e "$provider_timeout_fixture" ]]; then
+    printf '⎿ API Error: 524\nCloudflare origin did not return a complete response within the 120-second Proxy Read Timeout\n'
+  else
+    : > "$provider_timeout_fixture"
+    printf 'Claude is working\n'
+  fi
+}
+if wait_for_done "%fixture" "<<<DONE>>>" "/tmp/ask-tmux-no-response-fixture" 0 0 claude; then
+  provider_timeout_rc=0
+else
+  provider_timeout_rc=$?
+fi
+if wait_for_done "%fixture" "<<<DONE>>>" "/tmp/ask-tmux-no-response-fixture" 0 0 claude; then
+  stale_provider_timeout_rc=0
+else
+  stale_provider_timeout_rc=$?
+fi
+eval "$original_session_exists"
+eval "$original_capture_pane_text"
+rm -f "$provider_timeout_fixture"
+[[ "$provider_timeout_rc" == "4" ]] \
+  || fail "Claude gateway API Error 524 should be classified as a provider failure"
+[[ "$stale_provider_timeout_rc" == "2" ]] \
+  || fail "a stale Claude gateway error should not fail a later request"
+
 [[ "$(codex_update_prompt_choice "$update_prompt_two")" == "2" ]] || fail "expected update prompt choice 2"
 [[ "$(codex_update_prompt_choice "$update_prompt_three")" == "3" ]] || fail "expected update prompt choice 3"
 if codex_update_prompt_choice "$update_prompt_no_skip" >/dev/null; then
@@ -179,6 +211,71 @@ gated_stub_log="$gated_tmp/stub.log"
 python_bin="$(command -v python3)"
 mkdir -p "$gated_home" "$gated_stub_dir" "$gated_tmp/empty-bin"
 trap 'rm -rf "$gated_tmp"' EXIT
+
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$gated_stub_dir/cc-claude"
+printf '%s\n' '#!/bin/sh' 'exit 0' > "$gated_stub_dir/cc-deepseek"
+chmod +x "$gated_stub_dir/cc-claude" "$gated_stub_dir/cc-deepseek"
+
+claude_default_launch_cmd="$(
+  PATH="$gated_stub_dir:$PATH" provider_launch_command claude false
+)"
+claude_deepseek_launch_cmd="$(
+  PATH="$gated_stub_dir:$PATH" ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek \
+    provider_launch_command claude false
+)"
+claude_opus5_launch_cmd="$(
+  PATH="$gated_stub_dir:$PATH" provider_launch_command claude false claude-opus-5
+)"
+claude_low_effort_launch_cmd="$(
+  PATH="$gated_stub_dir:$PATH" provider_launch_command claude false claude-opus-5 low
+)"
+[[ "$claude_default_launch_cmd" == *"$gated_stub_dir/cc-claude"* &&
+   "$claude_default_launch_cmd" == *"--dangerously-skip-permissions"* ]] \
+  || fail "Claude launch should default to the isolated cc-claude launcher"
+[[ "$claude_deepseek_launch_cmd" == *"$gated_stub_dir/cc-deepseek"* &&
+   "$claude_deepseek_launch_cmd" == *"--dangerously-skip-permissions"* ]] \
+  || fail "DeepSeek launch should use the isolated cc-deepseek launcher"
+[[ "$claude_opus5_launch_cmd" == *"$gated_stub_dir/cc-claude"* &&
+   "$claude_opus5_launch_cmd" == *"--model"* &&
+   "$claude_opus5_launch_cmd" == *"claude-opus-5"* ]] \
+  || fail "Claude launch should accept an explicit Opus 5 model pin"
+[[ "$claude_low_effort_launch_cmd" == *"--model 'claude-opus-5'"* &&
+   "$claude_low_effort_launch_cmd" == *"--effort 'low'"* ]] \
+  || fail "Claude launch should pass an explicit effort level to cc-claude"
+claude_default_send_out="$(
+  PATH="$gated_stub_dir:$PATH" cmd_send \
+    --provider claude \
+    --stub \
+    --dry-run \
+    --cwd /tmp \
+    --cwd-mode current \
+    --key default-high-effort \
+    --prompt smoke
+)"
+grep -Fq 'DRY_RUN claude_effort=high' <<<"$claude_default_send_out" \
+  || fail "Claude send should default to high effort"
+if (
+  PATH="$gated_stub_dir:$PATH"
+  ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek
+  export PATH ASK_TMUX_CLAUDE_LAUNCHER
+  provider_launch_command claude false claude-opus-5
+) >/dev/null 2>&1; then
+  fail "DeepSeek launch should reject a Claude model pin"
+fi
+if (
+  PATH="$gated_stub_dir:$PATH"
+  provider_launch_command claude false claude-opus-5 turbo
+) >/dev/null 2>&1; then
+  fail "Claude launch should reject an unsupported effort level"
+fi
+if (
+  PATH="$gated_stub_dir:$PATH"
+  ASK_TMUX_CLAUDE_LAUNCHER=claude
+  export PATH ASK_TMUX_CLAUDE_LAUNCHER
+  provider_launch_command claude false
+) >/dev/null 2>&1; then
+  fail "Claude launch should reject a launcher outside the provider allowlist"
+fi
 
 write_success_transport() {
   local target="$1"
