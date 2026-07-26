@@ -358,9 +358,11 @@ bash tests/install-unit.sh
 bash tests/smoke.sh
 ```
 
-The tests do not call live Claude or Codex. The smoke test uses isolated tmux
-stub sessions and therefore requires the caller to have access to its tmux
-socket.
+The tests do not call live Claude or Codex. The smoke test uses a temporary
+`HOME` and an exact private tmux socket, so it cannot clean up sessions on the
+default server. The caller must still be allowed to create a Unix socket and
+tmux server; restricted app sandboxes may fail closed with
+`tmux_socket_denied`, while a host-terminal run can execute the real smoke.
 
 ## Safety
 

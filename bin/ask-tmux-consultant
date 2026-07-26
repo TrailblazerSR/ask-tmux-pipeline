@@ -1689,6 +1689,9 @@ cmd_send() {
     *) warn "unknown release policy '$release_policy'; leaving session live" ;;
   esac
 
+  flock -u 9 || true
+  exec 9>&-
+
   if [[ "$attach" == "true" ]]; then
     attach_tmux_session "$session" "attach_command"
   fi

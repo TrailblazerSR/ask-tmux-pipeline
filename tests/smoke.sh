@@ -3,6 +3,28 @@ set -euo pipefail
 
 ROOT="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)"
 TMPDIR="$(mktemp -d /tmp/ask-tmux-pipeline-smoke.XXXXXX)"
+REAL_TMUX_BIN="$(type -P tmux)"
+SMOKE_TMUX_SOCKET="$TMPDIR/private-tmux.sock"
+SMOKE_BIN_DIR="$TMPDIR/private-bin"
+SMOKE_HOME="$TMPDIR/private-home"
+SMOKE_TMUX_BIN="$SMOKE_BIN_DIR/tmux"
+SMOKE_CLAUDE_LAUNCHER="$SMOKE_HOME/bin/cc-claude"
+mkdir -p "$SMOKE_BIN_DIR" "$SMOKE_HOME/bin"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  > "$SMOKE_TMUX_BIN"
+printf 'exec %q -S %q "$@"\n' "$REAL_TMUX_BIN" "$SMOKE_TMUX_SOCKET" \
+  >> "$SMOKE_TMUX_BIN"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'printf "%s\n" "smoke launcher must not execute" >&2' \
+  'exit 99' \
+  > "$SMOKE_CLAUDE_LAUNCHER"
+chmod +x "$SMOKE_TMUX_BIN" "$SMOKE_CLAUDE_LAUNCHER"
+export HOME="$SMOKE_HOME"
+export PATH="$SMOKE_BIN_DIR:$SMOKE_HOME/bin:$PATH"
+export ASK_TMUX_TMUX_BIN="$SMOKE_TMUX_BIN"
+export ASK_TMUX_CLAUDE_LAUNCHER="cc-claude"
 
 if ! command -v rg >/dev/null 2>&1; then
   rg() {
@@ -41,32 +63,8 @@ gateway_timeout_kind="$(
 [[ "$gateway_timeout_kind" == "provider_gateway_timeout_524" ]]
 
 cleanup() {
+  "$REAL_TMUX_BIN" -S "$SMOKE_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true
   rm -rf "$TMPDIR"
-  while IFS= read -r state_file; do
-    rm -f "$state_file"
-  done < <(
-    find "$HOME/.omx/state/tmux-pipelines" -type f -name '*.json' -print 2>/dev/null |
-      while IFS= read -r candidate; do
-        if grep -q "$TMPDIR" "$candidate" 2>/dev/null; then
-          printf '%s\n' "$candidate"
-        fi
-      done
-  )
-  find "$HOME/.omx/state/tmux-pipelines" -type d -empty -delete 2>/dev/null || true
-  while IFS= read -r state_file; do
-    rm -f "$state_file"
-  done < <(
-    find "$HOME/.omx/state/consultants" -type f -name '*.json' -print 2>/dev/null |
-      while IFS= read -r candidate; do
-        if grep -q "$TMPDIR" "$candidate" 2>/dev/null; then
-          printf '%s\n' "$candidate"
-        fi
-      done
-  )
-  find "$HOME/.omx/state/consultants" -type d -empty -delete 2>/dev/null || true
-  while IFS= read -r session; do
-    tmux kill-session -t "$session" 2>/dev/null || true
-  done < <(tmux list-sessions -F '#S' 2>/dev/null | grep '^ask-tmux-' || true)
 }
 trap cleanup EXIT
 
@@ -103,6 +101,8 @@ printf '%s\n' "$claude_smoke_out" | rg -q 'Smoke consultant Claude path'
 
 stripped_path="/usr/bin:/bin:/usr/sbin:/sbin"
 claude_stripped_out="$(env -i HOME="$HOME" USER="${USER:-}" PATH="$stripped_path" SHELL="${SHELL:-/bin/sh}" \
+  ASK_TMUX_CLAUDE_LAUNCHER="$ASK_TMUX_CLAUDE_LAUNCHER" \
+  ASK_TMUX_TMUX_BIN="$ASK_TMUX_TMUX_BIN" \
   "$ROOT/bin/ask-tmux-claude" send \
     --stub \
     --key consultant-smoke-claude-stripped \
@@ -116,6 +116,7 @@ printf '%s\n' "$claude_stripped_out" | rg -q 'Stub consultant response for:'
 printf '%s\n' "$claude_stripped_out" | rg -q 'Smoke consultant Claude stripped path'
 
 codex_stripped_out="$(env -i HOME="$HOME" USER="${USER:-}" PATH="$stripped_path" SHELL="${SHELL:-/bin/sh}" \
+  ASK_TMUX_TMUX_BIN="$ASK_TMUX_TMUX_BIN" \
   "$ROOT/bin/ask-tmux-codex" send \
     --stub \
     --key consultant-smoke-codex \
