@@ -742,6 +742,30 @@ codex_text_shows_activity() {
   printf '%s' "$text" | rg -q 'Working|Swooping|esc to interrupt|^[[:space:]]*(•|⏺|✻)'
 }
 
+codex_pane_is_ready() {
+  local text="$1" recent
+  recent="$(printf '%s\n' "$text" | tail -n 20)"
+
+  # A working Codex pane can retain its composer and status footer while output
+  # is streaming. Do not mistake that transient combination for an idle prompt.
+  codex_text_shows_activity "$recent" && return 1
+
+  # Legacy Codex releases used an empty composer or a full startup banner.
+  printf '%s' "$recent" | rg -q '(^|[[:space:]])(›|>)[[:space:]]*$|What can I help|Type /help|Ready' && return 0
+  if printf '%s' "$text" | rg -q 'OpenAI Codex' && printf '%s' "$text" | rg -q 'permissions:|/model to change' && printf '%s' "$text" | rg -q 'gpt-[0-9].*·'; then
+    return 0
+  fi
+
+  # Codex 0.144+ fills the idle composer with rotating placeholder text, for
+  # example "› Write tests for @filename". Require the adjacent model/cwd
+  # footer so numbered trust/update choices are not accepted as ready.
+  if printf '%s' "$recent" | rg -q '^[[:space:]]*(›|>)[[:space:]]+[^[:space:]].*$' &&
+     printf '%s' "$recent" | rg -q '^[[:space:]]*gpt-[[:alnum:]._-]+.*·[[:space:]]+(~|/)'; then
+    return 0
+  fi
+  return 1
+}
+
 send_prompt_to_pane() {
   local pane="$1" prompt="$2" provider="${3:-}" prompt_marker="${4:-$2}" buffer_name attempt text
   buffer_name="ask-tmux-send-$$-$RANDOM"
@@ -773,11 +797,7 @@ pane_is_ready() {
 	    printf '%s' "$text" | rg -q '(^|[[:space:]])(>|❯)[[:space:]]*$|bypass permissions on|What can I help|Type /help'
 	    ;;
 	  codex)
-	    printf '%s' "$text" | rg -q '(^|[[:space:]])(›|>)[[:space:]]*$|What can I help|Type /help|Ready' && return 0
-	    if printf '%s' "$text" | rg -q 'OpenAI Codex' && printf '%s' "$text" | rg -q 'permissions:|/model to change' && printf '%s' "$text" | rg -q 'gpt-[0-9].*·'; then
-	      return 0
-	    fi
-	    return 1
+	    codex_pane_is_ready "$text"
 	    ;;
     *)
       return 1

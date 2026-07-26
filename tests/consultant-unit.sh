@@ -75,6 +75,42 @@ ready_with_stale_trust='
   gpt-5.5 xhigh fast · /tmp/project
 '
 
+ready_with_placeholder_composer='
+⚠ Skipped loading 133 skill(s) due to invalid SKILL.md files.
+
+› Write tests for @filename
+
+  gpt-5.6-sol high · /tmp/project
+'
+
+active_with_placeholder_composer='
+› Write tests for @filename
+
+◦ Working (4s • esc to interrupt)
+
+  gpt-5.6-sol high · /tmp/project
+'
+
+update_with_placeholder_shape='
+› 1. Update now
+  2. Skip
+  3. Skip until next version
+'
+
+hooks_with_placeholder_shape='
+  Hooks need review
+
+› 1. Review hooks
+  2. Trust all and continue
+'
+
+trust_with_placeholder_shape='
+  Do you trust the contents of this directory?
+
+› 1. Yes, continue
+  2. No, quit
+'
+
 claude_ready_with_status='
 ╭─── Claude Code v2.1.195 ─────────────────────────────────────────────────────╮
 │                 Welcome back!                                                │
@@ -153,6 +189,11 @@ codex_launch_cmd="$(provider_launch_command codex false)"
 
 assert_not_ready codex "$trust_plus_banner_no_composer"
 assert_ready codex "$ready_with_stale_trust"
+assert_ready codex "$ready_with_placeholder_composer"
+assert_not_ready codex "$active_with_placeholder_composer"
+assert_not_ready codex "$update_with_placeholder_shape"
+assert_not_ready codex "$hooks_with_placeholder_shape"
+assert_not_ready codex "$trust_with_placeholder_shape"
 assert_ready claude "$claude_ready_with_status"
 text_contains_sentinel "$wrapped_sentinel" "$sentinel" || fail "wrapped sentinel was not detected"
 
