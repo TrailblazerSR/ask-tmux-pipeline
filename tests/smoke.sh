@@ -34,7 +34,7 @@ if ! command -v rg >/dev/null 2>&1; then
 fi
 
 gateway_timeout_kind="$(
-  bash -c 'source "$1"; transport_failure_kind "$2"' _ \
+  bash -c 'source "$1"; consultant_failure_kind claude 1 "$2"' _ \
     "$ROOT/bin/ask-tmux-pipeline" \
     'ERROR: Claude provider gateway returned API Error 524 before completion.'
 )"
@@ -311,7 +311,10 @@ unrelated_out="$("${pipeline_gate_env[@]}" "$ROOT/bin/ask-tmux-claude-pipeline" 
   --cwd-mode current \
   --cwd "$TMPDIR" \
   --prompt "Unrelated pipeline should be denied by cooldown" 2>&1)" && unrelated_rc=0 || unrelated_rc=$?
-[[ "$unrelated_rc" == "30" ]]
+[[ "$unrelated_rc" == "76" ]]
+printf '%s\n' "$unrelated_out" | rg -q '^PIPELINE_STATUS=policy_deferred$'
+printf '%s\n' "$unrelated_out" | rg -q '^outcome_kind=policy_deferred$'
+printf '%s\n' "$unrelated_out" | rg -q '^policy_reason=project_cooldown$'
 [[ "$(grep -c '^raw:send ' "$raw_log")" == "3" ]]
 python3 - "$gate_home/.omx/state/review-budget.json" <<'PY'
 import json

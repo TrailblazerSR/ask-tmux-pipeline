@@ -179,9 +179,17 @@ pipeline.
 Before a consequential live request:
 
 ```bash
+ask-tmux-claude preflight --json
 ask-tmux-claude doctor
 ask-tmux-claude-pipeline doctor
 ```
+
+`preflight --json` performs a non-mutating `list-sessions` control query from
+the current caller context. `tmux_server_absent` is non-blocking because a send
+can create the server. `tmux_socket_denied`, `tmux_protocol_mismatch`,
+`tmux_client_missing`, and `tmux_control_failed` block the send before provider
+launch, gate admission, or new request artifacts. Existing continuation state
+is retained.
 
 Check routing without a provider call:
 
@@ -203,13 +211,37 @@ For Claude, the dry run should report `claude_launcher=cc-claude` and
 `claude_launcher=cc-deepseek` with blank requested model and effort fields,
 because the DeepSeek wrapper owns both.
 
+## Result Envelope
+
+New consultant responses start with one compact JSON object followed by one
+blank line:
+
+```json
+{"schema":"ask_tmux_pipeline.result.v2","status":"FINAL","stage":"initial"}
+```
+
+`status` is `FINAL`, `NEEDS_INPUT`, or `BLOCKED`. `NEEDS_INPUT` also carries
+non-empty string fields `question_id` and `question`, plus optional string
+field `recommended_default`. `stage` must match the requested stage. The
+legacy positional header remains accepted during migration, but new
+integrations should emit the JSON envelope.
+
 ## Failure Grammar
 
 - `PIPELINE_STATUS=waiting_for_user` with exit code `10`: relay the printed
   question and continue with `answer`; do not start over.
 - `PIPELINE_STATUS=ready_for_synthesis`: read `final_context` and synthesize.
 - `PIPELINE_STATUS=blocked`: report the blocker and artifact path.
-- Exit code `30`: inspect the transport output and state before retrying.
+- `outcome_kind=policy_deferred` with exit code `76`: no provider was launched.
+  An initial denial has `PIPELINE_STATUS=policy_deferred`; a denied answer or
+  review retains its resumable pipeline status. Read `policy_reason` and wait
+  for or explicitly resolve that admission condition.
+- Exit code `30`: read `outcome_kind` and any printed `outcome_artifact` before retrying.
+  Common kinds distinguish tmux control access, provider readiness or exit,
+  missing response, completion timeout, and gateway timeout.
+- `tmux_prompt_delivery_unconfirmed` with `retryable=false`: Enter reached the
+  provider, but the post-submit control check failed. The provider may still be
+  running; inspect the retained session and state before any deliberate retry.
 - `provider_gateway_timeout_524`: the provider gateway ended the request at its
   origin-response limit. Do not silently retry, switch providers, reduce effort,
   or increase the local wait timeout. Reduce or split the workload, then start a

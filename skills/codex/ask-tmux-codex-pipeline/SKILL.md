@@ -39,11 +39,20 @@ ask-tmux-codex-pure --cwd /path/to/project --prompt "PROMPT X FROM THE CURRENT C
 
 Add `--materials path` for relevant files. Use `--stub` for no-cost validation.
 
+Before a live send, run `ask-tmux-codex preflight --json`. It checks tmux
+control access from the current caller without creating a session or calling a
+provider.
+
 ## Clarification Relay
 
 The command prints stable markers. If it exits with code `10` and prints `PIPELINE_STATUS=waiting_for_user`, ask the user exactly the printed `question`, include `recommended_default` when present, and stop the current turn.
 
-The tmux consultant response header is strict: each header field must be exactly one physical line, followed by one blank line before the body.
+The preferred consultant response starts with a one-line
+`ask_tmux_pipeline.result.v2` JSON envelope followed by one blank line. Its
+`stage` must match the requested stage. A `NEEDS_INPUT` result requires
+non-empty string fields `question_id` and `question`; `recommended_default`
+is an optional string. The legacy positional header remains accepted during
+migration.
 
 After the user answers, resume the same pipeline:
 
@@ -76,7 +85,12 @@ Important markers:
 - `PIPELINE_STATUS=ready_for_synthesis`: read `final_context` and synthesize the final current-CLI response.
 - `PIPELINE_STATUS=waiting_for_user`: ask the printed question and wait.
 - `PIPELINE_STATUS=blocked`: report the blocker and relevant artifact path.
-- Exit code `30`: the underlying tmux consultant transport failed; inspect the printed output artifact or retry after checking `status`/`capture`.
+- Exit code `30`: inspect `outcome_kind` and any printed `outcome_artifact`
+  before retrying; it can identify a tmux-control, provider-readiness,
+  provider-exit, missing-response, completion-timeout, or gateway failure.
+- `tmux_prompt_delivery_unconfirmed` with `retryable=false`: Enter reached the
+  provider but confirmation was lost. Inspect the retained session and state;
+  do not automatically resend.
 
 Use `status`, `resume`, and `final-context` with `--pipeline-id` when recovering a pipeline. Treat `~/.omx/state/tmux-pipelines/current.json` as advisory only; if more than one pipeline may exist, use explicit `--pipeline-id` and `--cwd`.
 

@@ -51,7 +51,7 @@ if ! command -v rg >/dev/null 2>&1; then
   }
 fi
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 CLAUDE_PIPELINE_GATE_REASON="external_review_required"
 DEFAULT_CLAUDE_EFFORT="${ASK_TMUX_CLAUDE_EFFORT:-high}"
@@ -110,6 +110,7 @@ Exit codes:
   10  Pipeline is waiting for user input; this is an expected pause
   20  Pipeline is blocked or consultant response failed protocol parsing
   30  Underlying tmux consultant transport failed
+  76  Claude admission policy deferred this pipeline stage
   2   Usage error
 USAGE
 }
@@ -339,9 +340,45 @@ except Exception:
     value = None
 if isinstance(value, str):
     sys.stdout.write(value)
+elif isinstance(value, bool):
+    sys.stdout.write("true" if value else "false")
 elif value is not None:
     sys.stdout.write(str(value))
 PY
+}
+
+json_text_field() {
+  local record="$1" field="$2"
+  python3 - "$record" "$field" <<'PY'
+import json
+import sys
+
+try:
+    value = json.loads(sys.argv[1])
+    for part in sys.argv[2].split("."):
+        value = value.get(part) if isinstance(value, dict) else None
+except Exception:
+    value = None
+if isinstance(value, bool):
+    print("true" if value else "false")
+elif value is not None:
+    print(value)
+PY
+}
+
+require_pipeline_tmux_preflight() {
+  local provider="$1" report kind
+  if [[ ! -x "$BASE_RUNNER" ]]; then
+    die 30 "base runner is not executable: $BASE_RUNNER"
+  fi
+  if report="$("$BASE_RUNNER" preflight --json --provider "$provider" 2>&1)"; then
+    return
+  fi
+  kind="$(json_text_field "$report" kind)"
+  printf '%s\n' "$report" >&2
+  info "PIPELINE_STATUS=blocked" >&2
+  info "outcome_kind=${kind:-tmux_control_failed}" >&2
+  die 30 "tmux preflight blocked this pipeline before admission (${kind:-tmux_control_failed})"
 }
 
 pipeline_content_digest() {
@@ -405,8 +442,8 @@ try:
 except Exception:
     state = {}
 
-int_fields = {"question_seq", "response_count", "review_seq"}
-bool_fields = {"review_requested"}
+int_fields = {"question_seq", "response_count", "review_seq", "last_child_exit_code"}
+bool_fields = {"review_requested", "provider_started", "last_outcome_retryable"}
 
 for raw in sys.argv[2:]:
     key, sep, value = raw.partition("=")
@@ -486,6 +523,7 @@ normalize_mode() {
 parse_response_assignments() {
   local response_file="$1"
   python3 - "$response_file" <<'PY'
+import json
 import shlex
 import sys
 
@@ -500,27 +538,52 @@ except Exception as exc:
     raw_lines = []
     error = f"cannot read response: {exc}"
 
+envelope = None
 header = []
 if not error:
-    for line in raw_lines:
-        if not line.strip():
-            break
-        header.append(line)
-    if not header:
-        error = "missing pipeline status header"
+    if raw_lines and raw_lines[0].lstrip().startswith("{"):
+        try:
+            envelope = json.loads(raw_lines[0])
+        except Exception as exc:
+            error = f"invalid JSON result envelope: {exc}"
+        if not error and not isinstance(envelope, dict):
+            error = "JSON result envelope must be an object"
+        if not error and envelope.get("schema") != "ask_tmux_pipeline.result.v2":
+            error = f"unsupported JSON result schema: {envelope.get('schema') or '<empty>'}"
+        if not error and (len(raw_lines) < 2 or raw_lines[1].strip()):
+            error = "JSON result envelope must be followed by one blank line"
+    else:
+        for line in raw_lines:
+            if not line.strip():
+                break
+            header.append(line)
+        if not header:
+            error = "missing pipeline status header"
 
-if not error:
-    def parse_exact(line_number, expected_key):
-        if line_number >= len(header):
-            return None, f"missing required header line: {expected_key}"
-        line = header[line_number]
-        if ":" not in line:
-            return None, f"malformed header line {line_number + 1}: {line}"
-        key, value = line.split(":", 1)
-        if key.strip() != expected_key:
-            return None, f"expected {expected_key} at header line {line_number + 1}, got {key.strip() or '<empty>'}"
-        return value.strip(), ""
 
+def parse_exact(line_number, expected_key):
+    if line_number >= len(header):
+        return None, f"missing required header line: {expected_key}"
+    line = header[line_number]
+    if ":" not in line:
+        return None, f"malformed header line {line_number + 1}: {line}"
+    key, value = line.split(":", 1)
+    if key.strip() != expected_key:
+        return None, f"expected {expected_key} at header line {line_number + 1}, got {key.strip() or '<empty>'}"
+    return value.strip(), ""
+
+
+if not error and envelope is not None:
+    status_value = envelope.get("status")
+    stage_value = envelope.get("stage")
+    if not isinstance(status_value, str):
+        error = "JSON result status must be a string"
+    elif not isinstance(stage_value, str) or not stage_value.strip():
+        error = "JSON result stage must be a non-empty string"
+    else:
+        values["PIPELINE_STATUS"] = status_value.strip()
+        values["PIPELINE_STAGE"] = stage_value.strip()
+if not error and envelope is None:
     status_value, error = parse_exact(0, "PIPELINE_STATUS")
     if not error:
         values["PIPELINE_STATUS"] = status_value
@@ -531,8 +594,24 @@ if not error:
 status = values.get("PIPELINE_STATUS", "")
 if not error and status not in {"FINAL", "NEEDS_INPUT", "BLOCKED"}:
     error = f"invalid or missing PIPELINE_STATUS: {status or '<empty>'}"
-if not error and status == "NEEDS_INPUT":
+if not error and status == "NEEDS_INPUT" and envelope is not None:
+    question_id = envelope.get("question_id", "")
+    question = envelope.get("question", "")
+    recommended = envelope.get("recommended_default", "")
+    if not isinstance(question_id, str) or not question_id.strip():
+        error = "NEEDS_INPUT response must include a non-empty question_id"
+    elif not isinstance(question, str) or not question.strip():
+        error = "NEEDS_INPUT response must include question"
+    elif not isinstance(recommended, str):
+        error = "JSON result recommended_default must be a string"
+    else:
+        values["QUESTION_ID"] = question_id.strip()
+        values["QUESTION"] = question.strip()
+        values["RECOMMENDED_DEFAULT"] = recommended.strip()
+if not error and status == "NEEDS_INPUT" and envelope is None:
     question_id, error = parse_exact(2, "QUESTION_ID")
+    if not error and not question_id.strip():
+        error = "NEEDS_INPUT response must include a non-empty QUESTION_ID"
     if not error:
         values["QUESTION_ID"] = question_id
         question, error = parse_exact(3, "QUESTION")
@@ -546,7 +625,7 @@ if not error and status == "NEEDS_INPUT":
             values["RECOMMENDED_DEFAULT"] = recommended
     if not error and len(header) > 5:
         error = f"unexpected extra header line {len(header)}: {header[5]}"
-if not error and status in {"FINAL", "BLOCKED"} and len(header) > 2:
+if not error and envelope is None and status in {"FINAL", "BLOCKED"} and len(header) > 2:
     error = f"{status} response must not include extra header lines"
 
 if error:
@@ -575,40 +654,47 @@ PY
 
 write_structured_stub_response() {
   local response_file="$1" status="$2" stage="$3" question="$4" recommended="$5"
+
   case "$status" in
-    final|"")
-      {
-        printf 'PIPELINE_STATUS: FINAL\n'
-        printf 'PIPELINE_STAGE: %s\n\n' "$stage"
-        printf 'Stub pipeline final response for stage `%s`.\n' "$stage"
-      } > "$response_file"
-      ;;
-    needs-input)
-      {
-        printf 'PIPELINE_STATUS: NEEDS_INPUT\n'
-        printf 'PIPELINE_STAGE: %s\n' "$stage"
-        printf 'QUESTION_ID: consultant-q001\n'
-        printf 'QUESTION: %s\n' "${question:-What constraint should I apply before finalizing?}"
-        printf 'RECOMMENDED_DEFAULT: %s\n\n' "${recommended:-Proceed with the conservative default.}"
-        printf 'Stub pipeline clarification request.\n'
-      } > "$response_file"
-      ;;
-    blocked)
-      {
-        printf 'PIPELINE_STATUS: BLOCKED\n'
-        printf 'PIPELINE_STAGE: %s\n\n' "$stage"
-        printf 'Stub pipeline blocked response.\n'
-      } > "$response_file"
-      ;;
-    malformed)
-      {
-        printf 'This response intentionally lacks the required pipeline header.\n'
-      } > "$response_file"
-      ;;
-    *)
-      die 2 "unknown --stub-status: $status"
-      ;;
+    ""|final|needs-input|blocked|malformed) ;;
+    *) die 2 "unknown --stub-status: $status" ;;
   esac
+
+  python3 - "$response_file" "$status" "$stage" "$question" "$recommended" <<'PY'
+import json
+import sys
+
+path, requested_status, stage, question, recommended = sys.argv[1:]
+status = requested_status or "final"
+if status == "malformed":
+    text = "This response intentionally lacks the required pipeline result envelope.\n"
+elif status in {"final", "needs-input", "blocked"}:
+    envelope = {
+        "schema": "ask_tmux_pipeline.result.v2",
+        "status": {
+            "final": "FINAL",
+            "needs-input": "NEEDS_INPUT",
+            "blocked": "BLOCKED",
+        }[status],
+        "stage": stage,
+    }
+    if status == "needs-input":
+        envelope.update(
+            {
+                "question_id": "consultant-q001",
+                "question": question or "What constraint should I apply before finalizing?",
+                "recommended_default": recommended or "Proceed with the conservative default.",
+            }
+        )
+    body = {
+        "final": f"Stub pipeline final response for stage `{stage}`.",
+        "needs-input": "Stub pipeline clarification request.",
+        "blocked": "Stub pipeline blocked response.",
+    }[status]
+    text = json.dumps(envelope, ensure_ascii=False, separators=(",", ":")) + "\n\n" + body + "\n"
+with open(path, "w", encoding="utf-8") as handle:
+    handle.write(text)
+PY
 }
 
 consultant_prompt() {
@@ -618,30 +704,86 @@ Follow the tmux pipeline protocol for the owner prompt.
 Mode: $mode
 Stage: $stage
 
-Begin your response file with exactly this top-of-file header block, followed by one blank line:
-PIPELINE_STATUS: FINAL | NEEDS_INPUT | BLOCKED
-PIPELINE_STAGE: $stage
-QUESTION_ID: <only when NEEDS_INPUT>
-QUESTION: <one focused user question, only when NEEDS_INPUT>
-RECOMMENDED_DEFAULT: <recommended answer, only when useful>
+Begin your response file with exactly one single-line JSON object, followed by one blank line.
+The object must use this schema and the current stage:
+{"schema":"ask_tmux_pipeline.result.v2","status":"FINAL|NEEDS_INPUT|BLOCKED","stage":"$stage"}
+
+When status is NEEDS_INPUT, add these JSON string fields:
+a non-empty "question_id", a non-empty "question", and optionally
+"recommended_default".
 
 Rules:
 - Ask at most one user question.
 - Use NEEDS_INPUT only when the answer materially changes the final work.
 - Use FINAL when your work is ready for the owner CLI to synthesize.
 - Use BLOCKED only when no safe assumption or continuation is possible.
-- Each header field must be exactly one physical line; leave exactly one blank line after the header block.
+- Keep the JSON envelope on one physical line with no Markdown fence.
+- Leave exactly one blank line after the JSON envelope.
 - Stay read-only except for writing the required response file.
 EOF
 }
 
-transport_failure_kind() {
-  local output="$1"
+consultant_failure_kind() {
+  local provider="$1" child_status="$2" output="$3" marker gate_decision
+  marker="$(printf '%s\n' "$output" | sed -n 's/^ASK_TMUX_OUTCOME=//p' | tail -1)"
+  gate_decision="$(
+    printf '%s\n' "$output" |
+      sed -n \
+        -e 's/^ask-tmux-claude-gated: allowed:.*/allowed/p' \
+        -e 's/^ask-tmux-claude-gated: denied:.*/denied/p' |
+      sed -n '1p'
+  )"
+  if [[ "$provider" == "claude" && "$child_status" == "76" && "$gate_decision" == "denied" ]]; then
+    printf '%s\n' 'policy_deferred'
+    return
+  fi
+  case "$marker" in
+    tmux_client_missing|tmux_socket_denied|tmux_protocol_mismatch|tmux_control_failed|tmux_session_missing|tmux_session_create_failed|tmux_prompt_delivery_failed|tmux_prompt_delivery_unconfirmed|tmux_runtime_socket_denied|tmux_runtime_protocol_mismatch|tmux_runtime_control_failed|tmux_runtime_client_missing|tmux_pane_missing|provider_not_ready|provider_interaction_required|provider_process_exited|provider_readiness_failed|provider_no_progress_timeout|provider_completion_timeout|provider_response_missing|provider_gateway_timeout_524)
+      printf '%s\n' "$marker"
+      return
+      ;;
+  esac
   if printf '%s\n' "$output" | rg -q 'API Error:?[[:space:]]+524'; then
     printf '%s\n' 'provider_gateway_timeout_524'
   else
     printf '%s\n' 'consultant_transport_failed'
   fi
+}
+
+consultant_failure_retryable() {
+  local output="$1" marker
+  marker="$(
+    printf '%s\n' "$output" |
+      sed -n 's/^ASK_TMUX_RETRYABLE=//p' |
+      tail -1
+  )"
+  case "$marker" in
+    true|false) printf '%s\n' "$marker" ;;
+    *) printf '%s\n' '__DELETE__' ;;
+  esac
+}
+
+policy_denial_message() {
+  local output="$1" message
+  message="$(
+    printf '%s\n' "$output" |
+      sed -n 's/^ask-tmux-claude-gated: denied:[[:space:]]*//p' |
+      sed -n '1p'
+  )"
+  printf '%s\n' "${message:-Claude admission policy deferred this request}"
+}
+
+policy_denial_reason() {
+  local message="$1"
+  case "$message" in
+    *"project cooldown active"*) printf '%s\n' 'project_cooldown' ;;
+    *"project auto-review cap reached"*) printf '%s\n' 'project_cap' ;;
+    *"global auto-review cap reached"*) printf '%s\n' 'global_cap' ;;
+    *"duplicate Claude review"*) printf '%s\n' 'duplicate' ;;
+    *"continuation"*) printf '%s\n' 'continuation_denied' ;;
+    *"gate reason"*|*"--gate-reason"*) printf '%s\n' 'policy_invalid' ;;
+    *) printf '%s\n' 'admission_denied' ;;
+  esac
 }
 
 run_consultant() {
@@ -650,7 +792,10 @@ run_consultant() {
   shift 19
   local materials=("$@")
   local wrapper output_file response_file consultant_state output prompt
-  local gate_fingerprint gate_root_digest gate_content_digest transport_status transport_error_kind
+  local gate_fingerprint gate_root_digest gate_content_digest child_status failure_kind
+  local child_retryable
+  local policy_message policy_reason
+  local provider_started_value pipeline_failure_status
   wrapper="$(provider_wrapper "$provider")"
   prompt="$(consultant_prompt "$mode" "$stage")"
   output_file="$PIPELINE_DIR/consultant-${stage}-$(date +%Y%m%dT%H%M%S)-$$.out"
@@ -687,25 +832,91 @@ run_consultant() {
 
   state_set "$PIPELINE_STATE_FILE" "status=waiting_for_consultant" "last_stage=$stage"
   if output="$("${command_env[@]}" "${cmd[@]}" 2>&1)"; then
-    transport_status=0
+    child_status=0
   else
-    transport_status=$?
-    transport_error_kind="$(transport_failure_kind "$output")"
+    child_status=$?
+    failure_kind="$(consultant_failure_kind "$provider" "$child_status" "$output")"
+    child_retryable="$(consultant_failure_retryable "$output")"
     printf '%s\n' "$output" > "$output_file"
+    if [[ "$failure_kind" == "policy_deferred" ]]; then
+      policy_message="$(policy_denial_message "$output")"
+      policy_reason="$(policy_denial_reason "$policy_message")"
+      case "$stage" in
+        followup)
+          state_set "$PIPELINE_STATE_FILE" "status=waiting_for_user"
+          pipeline_failure_status="waiting_for_user"
+          ;;
+        review)
+          state_set "$PIPELINE_STATE_FILE" "status=ready_for_synthesis"
+          pipeline_failure_status="ready_for_synthesis"
+          ;;
+        *)
+          state_set "$PIPELINE_STATE_FILE" "status=policy_deferred"
+          pipeline_failure_status="policy_deferred"
+          ;;
+      esac
+      state_set "$PIPELINE_STATE_FILE" \
+        "blocked_reason=__DELETE__" \
+        "last_outcome_kind=policy_deferred" \
+        "last_outcome_retryable=__DELETE__" \
+        "last_policy_reason=$policy_reason" \
+        "last_child_exit_code=$child_status" \
+        "last_outcome_message=$policy_message" \
+        "last_outcome_artifact=$output_file" \
+        "provider_started=false" \
+        "last_transport_error_kind=__DELETE__" \
+        "last_transport_error=__DELETE__" \
+        "last_consultant_output=$output_file"
+      copy_state_indexes "$PIPELINE_STATE_FILE" "$provider" "$PROJECT_SLUG" "$(read_json_field "$PIPELINE_STATE_FILE" pipeline_id)"
+      printf '%s\n' "$output" >&2
+      info "PIPELINE_STATUS=$pipeline_failure_status" >&2
+      info "outcome_kind=policy_deferred" >&2
+      info "policy_reason=$policy_reason" >&2
+      info "outcome_artifact=$output_file" >&2
+      die 76 "Claude admission policy deferred this pipeline stage ($policy_reason)"
+    fi
     case "$stage" in
       followup)
-        state_set "$PIPELINE_STATE_FILE" "status=waiting_for_user" "blocked_reason=__DELETE__" "last_transport_error_kind=$transport_error_kind" "last_transport_error=consultant transport failed (exit $transport_status)" "last_consultant_output=$output_file"
+        state_set "$PIPELINE_STATE_FILE" "status=waiting_for_user" "blocked_reason=__DELETE__" "last_transport_error_kind=$failure_kind" "last_transport_error=consultant transport failed (exit $child_status)" "last_consultant_output=$output_file"
+        pipeline_failure_status="waiting_for_user"
         ;;
       review)
-        state_set "$PIPELINE_STATE_FILE" "status=ready_for_synthesis" "blocked_reason=__DELETE__" "last_transport_error_kind=$transport_error_kind" "last_transport_error=consultant transport failed (exit $transport_status)" "last_consultant_output=$output_file"
+        state_set "$PIPELINE_STATE_FILE" "status=ready_for_synthesis" "blocked_reason=__DELETE__" "last_transport_error_kind=$failure_kind" "last_transport_error=consultant transport failed (exit $child_status)" "last_consultant_output=$output_file"
+        pipeline_failure_status="ready_for_synthesis"
         ;;
       *)
-        state_set "$PIPELINE_STATE_FILE" "status=blocked" "blocked_reason=$transport_error_kind (exit $transport_status)" "last_transport_error_kind=$transport_error_kind" "last_transport_error=consultant transport failed (exit $transport_status)" "last_consultant_output=$output_file"
+        state_set "$PIPELINE_STATE_FILE" "status=blocked" "blocked_reason=$failure_kind (exit $child_status)" "last_transport_error_kind=$failure_kind" "last_transport_error=consultant transport failed (exit $child_status)" "last_consultant_output=$output_file"
+        pipeline_failure_status="blocked"
         ;;
     esac
+    case "$failure_kind" in
+      tmux_client_missing|tmux_socket_denied|tmux_protocol_mismatch|tmux_control_failed|tmux_session_create_failed)
+        provider_started_value="false"
+        ;;
+      tmux_session_missing|tmux_prompt_delivery_failed|tmux_prompt_delivery_unconfirmed|tmux_runtime_*|tmux_pane_missing|provider_*)
+        provider_started_value="true"
+        ;;
+      *)
+        provider_started_value="__DELETE__"
+        ;;
+    esac
+    state_set "$PIPELINE_STATE_FILE" \
+      "last_outcome_kind=$failure_kind" \
+      "last_outcome_retryable=$child_retryable" \
+      "last_policy_reason=__DELETE__" \
+      "last_child_exit_code=$child_status" \
+      "last_outcome_message=consultant failed (exit $child_status)" \
+      "last_outcome_artifact=$output_file" \
+      "provider_started=$provider_started_value"
     copy_state_indexes "$PIPELINE_STATE_FILE" "$provider" "$PROJECT_SLUG" "$(read_json_field "$PIPELINE_STATE_FILE" pipeline_id)"
-    printf '%s\n' "$output"
-    die 30 "tmux consultant transport failed ($transport_error_kind); output=$output_file"
+    printf '%s\n' "$output" >&2
+    info "PIPELINE_STATUS=$pipeline_failure_status" >&2
+    info "outcome_kind=$failure_kind" >&2
+    if [[ "$child_retryable" != "__DELETE__" ]]; then
+      info "retryable=$child_retryable" >&2
+    fi
+    info "outcome_artifact=$output_file" >&2
+    die 30 "tmux consultant transport failed ($failure_kind); output=$output_file"
   fi
   printf '%s\n' "$output" > "$output_file"
 
@@ -718,6 +929,13 @@ run_consultant() {
   state_set "$PIPELINE_STATE_FILE" \
     "latest_response_file=$response_file" \
     "last_consultant_output=$output_file" \
+    "last_outcome_kind=consultant_completed" \
+    "last_outcome_retryable=__DELETE__" \
+    "last_child_exit_code=0" \
+    "last_outcome_message=consultant completed this pipeline stage" \
+    "last_outcome_artifact=$output_file" \
+    "provider_started=true" \
+    "last_policy_reason=__DELETE__" \
     "last_transport_error_kind=__DELETE__" \
     "last_transport_error=__DELETE__" \
     "consultant_state_file=$consultant_state"
@@ -786,6 +1004,10 @@ handle_response() {
   local provider="$1" stage="$2" response_file="$3"
   local seq artifact response_count final_context
   eval "$(parse_response_assignments "$response_file")"
+  if [[ "$PARSED_STATUS" != "PARSE_ERROR" && "$PARSED_STAGE" != "$stage" ]]; then
+    PARSE_ERROR="PIPELINE_STAGE mismatch: expected $stage, got ${PARSED_STAGE:-<empty>}"
+    PARSED_STATUS="PARSE_ERROR"
+  fi
 
   response_count="$(read_json_field "$PIPELINE_STATE_FILE" response_count)"
   [[ "$response_count" =~ ^[0-9]+$ ]] || response_count=0
@@ -992,6 +1214,7 @@ cmd_start() {
     return
   fi
 
+  require_pipeline_tmux_preflight "$provider"
   mkdir -p "$PIPELINE_DIR"
   prompt_path="$PIPELINE_DIR/prompt.md"
   printf '%s\n' "$prompt_text" > "$prompt_path"
@@ -1054,6 +1277,7 @@ cmd_answer() {
   flock -w 2 7 || die 30 "pipeline operation is already running: $PIPELINE_DIR"
   status="$(read_json_field "$state_file" status)"
   [[ "$status" == "waiting_for_user" ]] || die 2 "pipeline is not waiting for user input; status=$status"
+  require_pipeline_tmux_preflight "$provider"
   answer_text="$(read_text_arg "$answer" "$answer_file")" || die 2 "answer requires --answer or --answer-file"
   seq="$(read_json_field "$state_file" pending_question_seq)"
   [[ "$seq" =~ ^[0-9]+$ ]] || die 2 "missing pending question sequence"
@@ -1110,6 +1334,7 @@ cmd_review() {
   flock -w 2 7 || die 30 "pipeline operation is already running: $PIPELINE_DIR"
   status="$(read_json_field "$state_file" status)"
   [[ "$status" == "ready_for_synthesis" ]] || die 2 "pipeline is not ready for review; status=$status"
+  require_pipeline_tmux_preflight "$provider"
   draft_text="$(read_text_arg "$draft" "$draft_file")" || die 2 "review requires --draft or --draft-file"
   draft_path="$PIPELINE_DIR/current-draft.md"
   printf '%s\n' "$draft_text" > "$draft_path"
@@ -1167,11 +1392,20 @@ for key in [
     "recommended_default",
     "latest_pipeline_response",
     "final_context_file",
+    "last_outcome_kind",
+    "last_outcome_retryable",
+    "last_policy_reason",
+    "last_child_exit_code",
+    "last_outcome_message",
+    "last_outcome_artifact",
+    "provider_started",
     "last_transport_error_kind",
     "blocked_reason",
 ]:
     value = state.get(key)
     if value not in (None, ""):
+        if isinstance(value, bool):
+            value = "true" if value else "false"
         print(f"{key}={value}")
 print(f"state_file={sys.argv[1]}")
 PY
@@ -1199,6 +1433,7 @@ cmd_resume() {
   case "$status" in
     waiting_for_user) exit 10 ;;
     blocked) exit 20 ;;
+    policy_deferred) exit 76 ;;
     *) exit 0 ;;
   esac
 }
@@ -1226,14 +1461,26 @@ cmd_final_context() {
 }
 
 cmd_doctor() {
-  local failed=0 claude_gate
+  local failed=0 claude_gate preflight_report preflight_kind
   info "ask-tmux-pipeline version=$VERSION"
   case "$DEFAULT_CLAUDE_EFFORT" in
     low|medium|high|xhigh|max) info "PASS default_claude_effort=$DEFAULT_CLAUDE_EFFORT" ;;
     *) info "FAIL invalid_default_claude_effort=$DEFAULT_CLAUDE_EFFORT"; failed=1 ;;
   esac
-  if [[ -x "$BASE_RUNNER" ]]; then info "PASS base_runner=$BASE_RUNNER"; else info "FAIL base_runner_not_executable=$BASE_RUNNER"; failed=1; fi
-  if command -v tmux >/dev/null; then info "PASS tmux=$(tmux -V)"; else info "FAIL tmux missing"; failed=1; fi
+  if [[ -x "$BASE_RUNNER" ]]; then
+    info "PASS base_runner=$BASE_RUNNER"
+    if preflight_report="$("$BASE_RUNNER" preflight --json 2>&1)"; then
+      preflight_kind="$(json_text_field "$preflight_report" kind)"
+      info "PASS tmux_control=${preflight_kind:-unknown}"
+    else
+      preflight_kind="$(json_text_field "$preflight_report" kind)"
+      info "FAIL tmux_control=${preflight_kind:-preflight_failed}"
+      failed=1
+    fi
+  else
+    info "FAIL base_runner_not_executable=$BASE_RUNNER"
+    failed=1
+  fi
   if [[ "${ASK_TMUX_RG_FALLBACK:-}" == "grep" ]]; then info "PASS rg=fallback-grep"; elif command -v rg >/dev/null; then info "PASS rg=$(command -v rg)"; else info "FAIL rg missing"; failed=1; fi
   if command -v python3 >/dev/null; then info "PASS python3=$(command -v python3)"; else info "FAIL python3 missing"; failed=1; fi
   mkdir -p "$PIPELINE_STATE_ROOT" 2>/dev/null || true

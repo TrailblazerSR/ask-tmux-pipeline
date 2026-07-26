@@ -29,8 +29,12 @@ ask-tmux-codex attach --key reviewer --cwd /path/to/project
 ask-tmux-codex release --key reviewer --cwd /path/to/project
 ask-tmux-codex cleanup --stale-after 24h
 ask-tmux-codex gc --stale-after 24h
+ask-tmux-codex preflight --json
 ask-tmux-codex doctor
 ```
+
+`preflight --json` is read-only and verifies tmux control access from the
+current caller before a live send.
 
 Reuse a live same-key session by default. Use `--key` as the consultant identity. Same-key sessions are separated by project and by a collision-safe key hash. Use `--cwd` with `capture`, `attach`, and `release` whenever the key could exist in multiple projects; ambiguous lifecycle commands fail instead of guessing. State is global under `~/.omx/state/consultants/`; logs are under `~/.omx/consultants/log.jsonl`; packets and responses are project-local under `.omx/consultants/`.
 

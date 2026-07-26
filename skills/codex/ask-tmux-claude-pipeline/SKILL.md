@@ -60,11 +60,20 @@ ask-tmux-claude-pure --cwd /path/to/project --prompt "PROMPT X FROM THE CURRENT 
 
 Add `--materials path` for relevant files. Use `--stub` for no-cost validation.
 
+Before a live send, run `ask-tmux-claude preflight --json`. It checks tmux
+control access from the current caller without creating a session or calling a
+provider.
+
 ## Clarification Relay
 
 The command prints stable markers. If it exits with code `10` and prints `PIPELINE_STATUS=waiting_for_user`, ask the user exactly the printed `question`, include `recommended_default` when present, and stop the current turn.
 
-The tmux consultant response header is strict: each header field must be exactly one physical line, followed by one blank line before the body.
+The preferred consultant response starts with a one-line
+`ask_tmux_pipeline.result.v2` JSON envelope followed by one blank line. Its
+`stage` must match the requested stage. A `NEEDS_INPUT` result requires
+non-empty string fields `question_id` and `question`; `recommended_default`
+is an optional string. The legacy positional header remains accepted during
+migration.
 
 After the user answers, resume the same pipeline:
 
@@ -97,7 +106,16 @@ Important markers:
 - `PIPELINE_STATUS=ready_for_synthesis`: read `final_context` and synthesize the final current-CLI response.
 - `PIPELINE_STATUS=waiting_for_user`: ask the printed question and wait.
 - `PIPELINE_STATUS=blocked`: report the blocker and relevant artifact path.
-- Exit code `30`: the underlying tmux consultant transport failed; inspect the printed output artifact or retry after checking `status`/`capture`.
+- `outcome_kind=policy_deferred` with exit code `76`: the gate denied
+  admission and no provider was launched; read `policy_reason`. An initial
+  denial has `PIPELINE_STATUS=policy_deferred`; a denied continuation retains
+  its resumable pipeline status.
+- Exit code `30`: inspect `outcome_kind` and any printed `outcome_artifact`
+  before retrying; it can identify a tmux-control, provider-readiness,
+  provider-exit, missing-response, completion-timeout, or gateway failure.
+- `tmux_prompt_delivery_unconfirmed` with `retryable=false`: Enter reached the
+  provider but confirmation was lost. Inspect the retained session and state;
+  do not automatically resend.
 
 The pipeline classifies Claude `API Error: 524` as
 `provider_gateway_timeout_524`. Do not automatically lower effort, switch

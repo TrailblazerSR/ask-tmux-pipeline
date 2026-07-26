@@ -12,6 +12,10 @@ Use `ask-tmux-claude-pipeline` / `ask-tmux-codex-pipeline` when the user wants t
 
 Use `ask-tmux-claude-pure` / `ask-tmux-codex-pure` when the user wants the same prompt mirrored to tmux Claude/Codex with minimal owner-side synthesis.
 
+Before a live send, use `ask-tmux-claude preflight --json` (or the Codex
+wrapper) to verify tmux control access from the current caller without creating
+a session or calling a provider.
+
 ## Commands By Situation
 
 ### 1. Simple Claude Review
@@ -58,6 +62,12 @@ ask-tmux-codex send \
 Use when prompt X should be sent to tmux Claude while the current CLI remains responsible for final synthesis.
 
 The dispatcher treats every Claude pipeline stage as automatic review traffic and routes it through `ask-tmux-claude-gated` with `--gate-reason external_review_required`. It fails closed when that local gate is unavailable; do not bypass it with the raw transport. The initial stage consumes one budget slot. Later answers and draft reviews are bounded, ordered continuations of the same project/key/pipeline and content-digest grant for up to 24 hours and eight continuation sends; a different pipeline still encounters the normal caps and cooldown.
+
+If admission is denied, the pipeline exits `76` with
+`outcome_kind=policy_deferred`, a typed `policy_reason`, and
+`provider_started=false`. An initial denial has
+`PIPELINE_STATUS=policy_deferred`; a denied continuation retains its resumable
+status. Do not treat it as a tmux/provider failure or retry it as transport.
 
 ```bash
 ask-tmux-claude-pipeline start \
@@ -125,6 +135,10 @@ ask-tmux-claude-pipeline status --pipeline-id <id> --cwd /path/to/project
 ask-tmux-claude-pipeline resume --pipeline-id <id> --cwd /path/to/project
 ask-tmux-claude-pipeline final-context --pipeline-id <id> --cwd /path/to/project
 ```
+
+For exit `30`, inspect `outcome_kind` and any printed `outcome_artifact`; the typed outcome
+distinguishes tmux access, provider startup/readiness, provider exit, missing
+response, completion timeout, and gateway timeout.
 
 ## Short Rule
 

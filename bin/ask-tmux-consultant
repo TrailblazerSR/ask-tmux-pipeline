@@ -51,7 +51,7 @@ if ! command -v rg >/dev/null 2>&1; then
   }
 fi
 
-VERSION="0.2.0"
+VERSION="0.3.0"
 STATE_ROOT="${ASK_TMUX_STATE_ROOT:-$HOME/.omx/state/consultants}"
 ARTIFACT_ROOT="${ASK_TMUX_ARTIFACT_ROOT:-$HOME/.omx/artifacts/consultants}"
 LOG_PATH="${ASK_TMUX_LOG_PATH:-$HOME/.omx/consultants/log.jsonl}"
@@ -72,6 +72,7 @@ Commands:
   release   Kill managed consultant tmux session(s)
   cleanup   Release stale managed consultant sessions
   gc        Alias for cleanup
+  preflight Run a read-only caller-context tmux control probe
   doctor    Check tmux, provider CLI, runner helpers, and state paths
 
 Common options:
@@ -109,6 +110,408 @@ warn() {
 
 info() {
   printf '%s\n' "$*"
+}
+
+fail_outcome() {
+  local kind="$1" retryable="$2"
+  shift 2
+  printf 'ASK_TMUX_OUTCOME=%s\n' "$kind" >&2
+  printf 'ASK_TMUX_RETRYABLE=%s\n' "$retryable" >&2
+  die "$*"
+}
+
+tmux_binary() {
+  local configured="${ASK_TMUX_TMUX_BIN:-}"
+  if [[ -n "$configured" ]]; then
+    if [[ -x "$configured" ]]; then
+      printf '%s\n' "$configured"
+      return 0
+    fi
+    return 1
+  fi
+  type -P tmux 2>/dev/null
+}
+
+tmux() {
+  local binary
+  binary="$(tmux_binary)" || return 127
+  command "$binary" "$@"
+}
+
+tmux_preflight_json() {
+  local binary
+  binary="$(tmux_binary 2>/dev/null || true)"
+  python3 - "$binary" <<'PY'
+import json
+import os
+import socket
+import subprocess
+import sys
+
+binary = sys.argv[1].strip()
+record = {
+    "schema": "ask_tmux_preflight.v1",
+    "status": "blocked",
+    "phase": "tmux_control",
+    "kind": "tmux_client_missing",
+    "blocking": True,
+    "retryable": False,
+    "command_exit": 127,
+    "stdout": "",
+    "stderr": "tmux is not installed or executable",
+    "caller": {
+        "host": socket.gethostname(),
+        "uid": os.getuid() if hasattr(os, "getuid") else None,
+        "pid": os.getpid(),
+        "cwd": os.getcwd(),
+    },
+    "tmux": {
+        "binary": binary,
+        "version": "",
+    },
+}
+
+if not binary:
+    print(json.dumps(record, sort_keys=True))
+    raise SystemExit(1)
+
+try:
+    version_run = subprocess.run(
+        [binary, "-V"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=5,
+        check=False,
+    )
+except (OSError, subprocess.SubprocessError) as exc:
+    record["kind"] = "tmux_client_missing"
+    record["stderr"] = str(exc)[:2000]
+    print(json.dumps(record, sort_keys=True))
+    raise SystemExit(1)
+
+record["tmux"]["version"] = (
+    version_run.stdout.strip() or version_run.stderr.strip()
+)[:500]
+if version_run.returncode != 0:
+    record["kind"] = "tmux_control_failed"
+    record["command_exit"] = int(version_run.returncode)
+    record["stderr"] = version_run.stderr.strip()[:2000]
+    print(json.dumps(record, sort_keys=True))
+    raise SystemExit(1)
+
+try:
+    probe = subprocess.run(
+        [binary, "list-sessions", "-F", "#{session_name}"],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=5,
+        check=False,
+    )
+except subprocess.TimeoutExpired as exc:
+    record.update(
+        {
+            "kind": "tmux_control_failed",
+            "retryable": True,
+            "command_exit": 124,
+            "stderr": f"tmux control probe timed out: {exc}"[:2000],
+        }
+    )
+    print(json.dumps(record, sort_keys=True))
+    raise SystemExit(1)
+except OSError as exc:
+    record.update(
+        {
+            "kind": "tmux_client_missing",
+            "command_exit": 127,
+            "stderr": str(exc)[:2000],
+        }
+    )
+    print(json.dumps(record, sort_keys=True))
+    raise SystemExit(1)
+
+stdout = probe.stdout.strip()[:4000]
+stderr = probe.stderr.strip()[:4000]
+detail = f"{stderr}\n{stdout}".lower()
+record["command_exit"] = int(probe.returncode)
+record["stdout"] = stdout
+record["stderr"] = stderr
+
+if probe.returncode == 0:
+    record.update(
+        {
+            "status": "ready",
+            "kind": "tmux_control_ready",
+            "blocking": False,
+            "retryable": False,
+        }
+    )
+elif any(
+    marker in detail
+    for marker in ("operation not permitted", "permission denied", "access denied")
+):
+    record.update(
+        {
+            "kind": "tmux_socket_denied",
+            "blocking": True,
+            "retryable": False,
+        }
+    )
+elif "protocol version mismatch" in detail or (
+    "protocol" in detail and "mismatch" in detail
+):
+    record.update(
+        {
+            "kind": "tmux_protocol_mismatch",
+            "blocking": True,
+            "retryable": False,
+        }
+    )
+elif "no server running" in detail or (
+    "error connecting to" in detail and "no such file or directory" in detail
+):
+    record.update(
+        {
+            "status": "ready",
+            "kind": "tmux_server_absent",
+            "blocking": False,
+            "retryable": True,
+        }
+    )
+else:
+    record.update(
+        {
+            "kind": "tmux_control_failed",
+            "blocking": True,
+            "retryable": True,
+        }
+    )
+
+print(json.dumps(record, sort_keys=True))
+raise SystemExit(1 if record["blocking"] else 0)
+PY
+}
+
+preflight_json_field() {
+  local record="$1" field="$2"
+  python3 - "$record" "$field" <<'PY'
+import json
+import sys
+
+value = json.loads(sys.argv[1])
+for part in sys.argv[2].split("."):
+    if not isinstance(value, dict):
+        value = None
+        break
+    value = value.get(part)
+if isinstance(value, bool):
+    print("true" if value else "false")
+elif value is not None:
+    print(value)
+PY
+}
+
+TMUX_CONTROL_COMMAND=""
+TMUX_CONTROL_EXIT=0
+TMUX_CONTROL_STDOUT=""
+TMUX_CONTROL_STDERR=""
+TMUX_CONTROL_KIND=""
+TMUX_CONTROL_RETRYABLE="true"
+TMUX_RESOLVED_PANE=""
+TMUX_CAPTURE_TEXT=""
+TMUX_PROMPT_DELIVERY_PHASE=""
+
+classify_tmux_control_failure() {
+  local detail
+  detail="$(
+    printf '%s\n%s\n' "$TMUX_CONTROL_STDERR" "$TMUX_CONTROL_STDOUT" \
+      | tr '[:upper:]' '[:lower:]'
+  )"
+  case "$detail" in
+    *"operation not permitted"*|*"permission denied"*|*"access denied"*)
+      TMUX_CONTROL_KIND="tmux_socket_denied"
+      TMUX_CONTROL_RETRYABLE="false"
+      ;;
+    *"protocol version mismatch"*|*"protocol"*"mismatch"*)
+      TMUX_CONTROL_KIND="tmux_protocol_mismatch"
+      TMUX_CONTROL_RETRYABLE="false"
+      ;;
+    *"can't find pane"*|*"no such pane"*)
+      TMUX_CONTROL_KIND="tmux_pane_missing"
+      TMUX_CONTROL_RETRYABLE="true"
+      ;;
+    *)
+      if [[ "$TMUX_CONTROL_EXIT" == "127" ]]; then
+        TMUX_CONTROL_KIND="tmux_client_missing"
+        TMUX_CONTROL_RETRYABLE="false"
+      else
+        TMUX_CONTROL_KIND="tmux_control_failed"
+        TMUX_CONTROL_RETRYABLE="true"
+      fi
+      ;;
+  esac
+}
+
+tmux_control_command() {
+  local stderr_file
+  TMUX_CONTROL_COMMAND="${1:-tmux}"
+  TMUX_CONTROL_EXIT=0
+  TMUX_CONTROL_STDOUT=""
+  TMUX_CONTROL_STDERR=""
+  TMUX_CONTROL_KIND=""
+  TMUX_CONTROL_RETRYABLE="true"
+  stderr_file="$(mktemp "${TMPDIR:-/tmp}/ask-tmux-control.XXXXXX")"
+  if TMUX_CONTROL_STDOUT="$(tmux "$@" 2>"$stderr_file")"; then
+    TMUX_CONTROL_EXIT=0
+  else
+    TMUX_CONTROL_EXIT="$?"
+  fi
+  TMUX_CONTROL_STDERR="$(sed -n '1,200p' "$stderr_file")"
+  rm -f "$stderr_file"
+  if [[ "$TMUX_CONTROL_EXIT" == "0" ]]; then
+    return 0
+  fi
+  classify_tmux_control_failure
+  return 1
+}
+
+tmux_session_liveness() {
+  local session="$1"
+  if tmux_control_command has-session -t "$session"; then
+    return 0
+  fi
+  if tmux_control_confirms_session_absence; then
+    return 1
+  fi
+  return 2
+}
+
+tmux_control_confirms_session_absence() {
+  local detail
+  detail="$(
+    printf '%s\n%s\n' "$TMUX_CONTROL_STDERR" "$TMUX_CONTROL_STDOUT" \
+      | tr '[:upper:]' '[:lower:]'
+  )"
+  case "$detail" in
+    *"can't find session"*|*"no such session"*|*"no server running"*|*"no sessions"*|*"error connecting to"*"no such file or directory"*)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+capture_pane_text_checked() {
+  local pane="$1" lines="${2:-120}"
+  TMUX_CAPTURE_TEXT=""
+  if tmux_control_command capture-pane -J -t "$pane" -p -S "-$lines"; then
+    TMUX_CAPTURE_TEXT="$TMUX_CONTROL_STDOUT"
+    return 0
+  fi
+  return 2
+}
+
+kill_tmux_session_checked() {
+  local session="$1" liveness_status
+  if tmux_session_liveness "$session"; then
+    :
+  else
+    liveness_status="$?"
+    [[ "$liveness_status" == "1" ]] && return 1
+    return 2
+  fi
+  if tmux_control_command kill-session -t "$session"; then
+    return 0
+  fi
+  if tmux_control_confirms_session_absence; then
+    return 1
+  fi
+  return 2
+}
+
+pane_target_for_session_checked() {
+  local session="$1" preferred_pane="${2:-}"
+  TMUX_RESOLVED_PANE=""
+  if [[ -n "$preferred_pane" ]]; then
+    if tmux_control_command display-message -p -t "$preferred_pane" '#{pane_id}'; then
+      TMUX_RESOLVED_PANE="$preferred_pane"
+      return 0
+    fi
+    if [[ "$TMUX_CONTROL_KIND" != "tmux_pane_missing" ]]; then
+      return 2
+    fi
+  fi
+  if ! tmux_control_command list-panes -t "$session" -F '#{pane_id}'; then
+    return 2
+  fi
+  TMUX_RESOLVED_PANE="$(printf '%s\n' "$TMUX_CONTROL_STDOUT" | sed -n '1p')"
+  [[ -n "$TMUX_RESOLVED_PANE" ]] || return 1
+  return 0
+}
+
+tmux_control_report() {
+  local outcome_kind="$1" retryable="$2"
+  TMUX_REPORT_OUTCOME="$outcome_kind" \
+  TMUX_REPORT_RETRYABLE="$retryable" \
+  TMUX_REPORT_COMMAND="$TMUX_CONTROL_COMMAND" \
+  TMUX_REPORT_CONTROL_KIND="$TMUX_CONTROL_KIND" \
+  TMUX_REPORT_EXIT="$TMUX_CONTROL_EXIT" \
+  TMUX_REPORT_STDOUT="$TMUX_CONTROL_STDOUT" \
+  TMUX_REPORT_STDERR="$TMUX_CONTROL_STDERR" \
+    python3 - <<'PY'
+import json
+import os
+
+def bounded(name):
+    return os.environ.get(name, "")[:4000]
+
+print(json.dumps({
+    "schema": "ask_tmux_runtime_control.v1",
+    "phase": "tmux_control_runtime",
+    "kind": bounded("TMUX_REPORT_OUTCOME"),
+    "control_kind": bounded("TMUX_REPORT_CONTROL_KIND"),
+    "retryable": bounded("TMUX_REPORT_RETRYABLE") == "true",
+    "command": bounded("TMUX_REPORT_COMMAND"),
+    "command_exit": int(os.environ.get("TMUX_REPORT_EXIT", "1")),
+    "stdout": bounded("TMUX_REPORT_STDOUT"),
+    "stderr": bounded("TMUX_REPORT_STDERR"),
+}, sort_keys=True))
+PY
+}
+
+fail_tmux_control() {
+  local outcome_kind="$1" retryable="$2"
+  shift 2
+  printf 'ASK_TMUX_OUTCOME=%s\n' "$outcome_kind" >&2
+  printf 'ASK_TMUX_RETRYABLE=%s\n' "$retryable" >&2
+  tmux_control_report "$outcome_kind" "$retryable" >&2
+  die "$*"
+}
+
+runtime_tmux_outcome_kind() {
+  case "$TMUX_CONTROL_KIND" in
+    tmux_socket_denied) printf '%s\n' "tmux_runtime_socket_denied" ;;
+    tmux_protocol_mismatch) printf '%s\n' "tmux_runtime_protocol_mismatch" ;;
+    tmux_client_missing) printf '%s\n' "tmux_runtime_client_missing" ;;
+    tmux_pane_missing) printf '%s\n' "tmux_pane_missing" ;;
+    *) printf '%s\n' "tmux_runtime_control_failed" ;;
+  esac
+}
+
+attach_tmux_session() {
+  local session="$1" output_label="${2:-}" binary
+  binary="$(tmux_binary)" || fail_outcome "tmux_client_missing" "false" \
+    "tmux is not installed or executable"
+  if [[ -t 1 ]]; then
+    exec "$binary" attach -t "$session"
+  fi
+  if [[ -n "$output_label" ]]; then
+    info "$output_label=$binary attach -t $session"
+  else
+    info "$binary attach -t $session"
+  fi
 }
 
 json_escape() {
@@ -286,21 +689,6 @@ template_prompt() {
       die "unknown --task: $task"
       ;;
   esac
-}
-
-session_exists() {
-  tmux has-session -t "$1" 2>/dev/null
-}
-
-pane_target_for_session() {
-  local session="$1" preferred_pane="${2:-}" pane
-  if [[ -n "$preferred_pane" ]] && tmux display-message -p -t "$preferred_pane" '#{pane_id}' >/dev/null 2>&1; then
-    printf '%s\n' "$preferred_pane"
-    return 0
-  fi
-  pane="$(tmux list-panes -t "$session" -F '#{pane_id}' 2>/dev/null | sed -n '1p')"
-  [[ -n "$pane" ]] || return 1
-  printf '%s\n' "$pane"
 }
 
 state_file_for() {
@@ -675,11 +1063,6 @@ write_packet() {
   } > "$packet"
 }
 
-capture_pane_text() {
-  local pane="$1" lines="${2:-120}"
-  tmux capture-pane -J -t "$pane" -p -S "-$lines" 2>/dev/null || true
-}
-
 text_contains_sentinel() {
   local text="$1" sentinel="$2" compact_text compact_sentinel
   if printf '%s' "$text" | rg -Fq "$sentinel"; then
@@ -744,22 +1127,51 @@ codex_text_shows_activity() {
 
 send_prompt_to_pane() {
   local pane="$1" prompt="$2" provider="${3:-}" prompt_marker="${4:-$2}" buffer_name attempt text
+  local failed_command failed_exit failed_stdout failed_stderr failed_kind failed_retryable
+  TMUX_PROMPT_DELIVERY_PHASE="not_started"
   buffer_name="ask-tmux-send-$$-$RANDOM"
-  tmux set-buffer -b "$buffer_name" -- "$prompt"
-  tmux paste-buffer -d -b "$buffer_name" -t "$pane"
+  tmux_control_command set-buffer -b "$buffer_name" -- "$prompt" || return 1
+  TMUX_PROMPT_DELIVERY_PHASE="buffered"
+  if ! tmux_control_command paste-buffer -d -b "$buffer_name" -t "$pane"; then
+    failed_command="$TMUX_CONTROL_COMMAND"
+    failed_exit="$TMUX_CONTROL_EXIT"
+    failed_stdout="$TMUX_CONTROL_STDOUT"
+    failed_stderr="$TMUX_CONTROL_STDERR"
+    failed_kind="$TMUX_CONTROL_KIND"
+    failed_retryable="$TMUX_CONTROL_RETRYABLE"
+    tmux_control_command delete-buffer -b "$buffer_name" >/dev/null 2>&1 || true
+    TMUX_CONTROL_COMMAND="$failed_command"
+    TMUX_CONTROL_EXIT="$failed_exit"
+    TMUX_CONTROL_STDOUT="$failed_stdout"
+    TMUX_CONTROL_STDERR="$failed_stderr"
+    TMUX_CONTROL_KIND="$failed_kind"
+    TMUX_CONTROL_RETRYABLE="$failed_retryable"
+    TMUX_PROMPT_DELIVERY_PHASE="paste_failed"
+    return 1
+  fi
+  TMUX_PROMPT_DELIVERY_PHASE="pasted"
   sleep 0.3
-  tmux send-keys -t "$pane" Enter
+  tmux_control_command send-keys -t "$pane" Enter || return 1
+  TMUX_PROMPT_DELIVERY_PHASE="accepted"
   if [[ "$provider" == "codex" ]]; then
     for attempt in 1 2 3 4 5; do
       sleep 0.7
-      text="$(capture_pane_text "$pane" 80)"
+      if ! tmux_control_command capture-pane -J -t "$pane" -p -S "-80"; then
+        TMUX_PROMPT_DELIVERY_PHASE="accepted_unconfirmed"
+        return 2
+      fi
+      text="$TMUX_CONTROL_STDOUT"
       if codex_prompt_needs_second_submit "$text" "$prompt_marker"; then
-        tmux send-keys -t "$pane" Enter
+        if ! tmux_control_command send-keys -t "$pane" Enter; then
+          TMUX_PROMPT_DELIVERY_PHASE="accepted_unconfirmed"
+          return 2
+        fi
         break
       fi
       codex_text_shows_activity "$text" && break
     done
   fi
+  TMUX_PROMPT_DELIVERY_PHASE="confirmed"
 }
 
 pane_is_ready() {
@@ -786,19 +1198,26 @@ pane_is_ready() {
 }
 
 wait_for_ready() {
-  local provider="$1" stub="$2" pane="$3" timeout="$4" auto_trust="$5"
-  local start now text
+  local provider="$1" stub="$2" session="$3" pane="$4" timeout="$5" auto_trust="$6"
+  local start now text liveness_rc
   start="$(date +%s)"
   while true; do
-    session_exists "${pane%%:*}" || return 1
-    text="$(capture_pane_text "$pane" 120)"
+    if tmux_session_liveness "$session"; then
+      :
+    else
+      liveness_rc="$?"
+      [[ "$liveness_rc" == "1" ]] && return 3
+      return 5
+    fi
+    tmux_control_command capture-pane -J -t "$pane" -p -S "-120" || return 5
+    text="$TMUX_CONTROL_STDOUT"
     if pane_is_ready "$provider" "$stub" "$text"; then
       return 0
     fi
     if [[ "$provider" == "codex" ]] && printf '%s' "$text" | rg -q 'Update available!.*->|Update now.*Skip|Skip until next version'; then
       local update_choice
       if update_choice="$(codex_update_prompt_choice "$text")"; then
-        tmux send-keys -t "$pane" "$update_choice" Enter
+        tmux_control_command send-keys -t "$pane" "$update_choice" Enter || return 5
         sleep 1
         continue
       fi
@@ -806,7 +1225,7 @@ wait_for_ready() {
     if [[ "$provider" == "codex" ]] && printf '%s' "$text" | rg -q 'Hooks need review|Trust all and continue|Continue without trusting'; then
       local hooks_choice
       if [[ "$auto_trust" == "true" ]] && hooks_choice="$(codex_hooks_prompt_choice "$text")"; then
-        tmux send-keys -t "$pane" "$hooks_choice" Enter
+        tmux_control_command send-keys -t "$pane" "$hooks_choice" Enter || return 5
         sleep 1
         continue
       fi
@@ -815,7 +1234,7 @@ wait_for_ready() {
     fi
     if [[ "$provider" == "codex" ]] && printf '%s' "$text" | rg -q 'Do you trust the contents of this directory|Yes, continue'; then
       if [[ "$auto_trust" == "true" ]]; then
-        tmux send-keys -t "$pane" Enter
+        tmux_control_command send-keys -t "$pane" Enter || return 5
         sleep 1
         continue
       fi
@@ -824,7 +1243,7 @@ wait_for_ready() {
     fi
     if printf '%s' "$text" | rg -q 'Quick safety check|Yes, I trust this folder|Enter to confirm'; then
       if [[ "$auto_trust" == "true" ]]; then
-        tmux send-keys -t "$pane" Enter
+        tmux_control_command send-keys -t "$pane" Enter || return 5
         sleep 1
       else
         warn "consultant is waiting at a workspace trust prompt; attach and confirm, or rerun with --auto-trust"
@@ -841,13 +1260,21 @@ wait_for_ready() {
 }
 
 wait_for_done() {
-  local pane="$1" sentinel="$2" response_path="$3" timeout="$4" min_response_epoch="${5:-0}" provider="${6:-}"
-  local start now text saw_sentinel="false" initial_gateway_524_count current_gateway_524_count
+  local session="$1" pane="$2" sentinel="$3" response_path="$4" timeout="$5" min_response_epoch="${6:-0}" provider="${7:-}"
+  local start now text saw_sentinel="false" initial_gateway_524_count current_gateway_524_count liveness_rc
   start="$(date +%s)"
-  initial_gateway_524_count="$(capture_pane_text "$pane" 2000 | awk 'index($0, "⎿") && index($0, "API Error: 524") { count++ } END { print count + 0 }')"
+  tmux_control_command capture-pane -J -t "$pane" -p -S "-2000" || return 5
+  initial_gateway_524_count="$(printf '%s\n' "$TMUX_CONTROL_STDOUT" | awk 'index($0, "⎿") && index($0, "API Error: 524") { count++ } END { print count + 0 }')"
   while true; do
-    session_exists "${pane%%:*}" || return 1
-    text="$(capture_pane_text "$pane" 2000)"
+    if tmux_session_liveness "$session"; then
+      :
+    else
+      liveness_rc="$?"
+      [[ "$liveness_rc" == "1" ]] && return 1
+      return 5
+    fi
+    tmux_control_command capture-pane -J -t "$pane" -p -S "-2000" || return 5
+    text="$TMUX_CONTROL_STDOUT"
     if text_contains_sentinel "$text" "$sentinel"; then
       saw_sentinel="true"
       if response_file_is_fresh "$response_path" "$min_response_epoch"; then
@@ -921,7 +1348,6 @@ cmd_send() {
       die "--model and --effort are not supported with cc-deepseek; DeepSeek owns its model mapping"
     fi
   fi
-  command -v tmux >/dev/null || die "tmux is required"
   owner_prompt="${owner_prompt:-$(template_prompt "$task")}"
 
   [[ "$ready_timeout" =~ ^[0-9]+$ ]] || die "--ready-timeout must be seconds"
@@ -942,12 +1368,8 @@ cmd_send() {
   response_root="$resolved/.omx/consultants/responses"
   response="$response_root/${run_stamp}-${provider}-${key_id}.md"
   done_sentinel="<<<ASK_TMUX_DONE:${provider}:${key_id}:$(date +%s):$$>>>"
-  if [[ "$provider" == "claude" ]]; then
-    preflight_claude_credentials "$stub"
-  fi
-  launch_cmd="$(provider_launch_command "$provider" "$stub" "$requested_model" "$requested_effort")"
-
   if [[ "$dry_run" == "true" ]]; then
+    launch_cmd="$(provider_launch_command "$provider" "$stub" "$requested_model" "$requested_effort")"
     info "DRY_RUN provider=$provider"
     info "DRY_RUN cwd=$resolved"
     info "DRY_RUN project_slug=$project_slug"
@@ -967,17 +1389,55 @@ cmd_send() {
 	    return
   fi
 
+  local preflight_report preflight_kind preflight_retryable
+  if ! preflight_report="$(tmux_preflight_json)"; then
+    preflight_kind="$(preflight_json_field "$preflight_report" kind)"
+    preflight_retryable="$(preflight_json_field "$preflight_report" retryable)"
+    printf 'ASK_TMUX_OUTCOME=%s\n' "$preflight_kind" >&2
+    printf 'ASK_TMUX_RETRYABLE=%s\n' "$preflight_retryable" >&2
+    printf '%s\n' "$preflight_report" >&2
+    die "tmux preflight blocked this send: $preflight_kind"
+  fi
+
+  if [[ "$provider" == "claude" ]]; then
+    preflight_claude_credentials "$stub"
+  fi
+  launch_cmd="$(provider_launch_command "$provider" "$stub" "$requested_model" "$requested_effort")"
+
   mkdir -p "$(dirname "$state_file")"
   exec 9>"$lock_file"
   flock -w 2 9 || die "state is locked by another ask-tmux operation: $lock_file"
 
   if [[ -f "$state_file" ]]; then
     local old_busy old_session old_pane old_sentinel old_response old_started old_key old_model old_launcher old_effort now_epoch
+    local old_liveness_status=1 old_pane_status=1 old_capture_text="" reconciliation_control_kind
     old_busy="$(read_json_bool "$state_file" busy)"
     old_session="$(read_json_field "$state_file" session_name)"
     old_pane="$(read_json_field "$state_file" pane_target)"
-    if [[ -n "$old_session" ]] && session_exists "$old_session"; then
-      old_pane="$(pane_target_for_session "$old_session" "$old_pane" || true)"
+    if [[ -n "$old_session" ]]; then
+      if tmux_session_liveness "$old_session"; then
+        old_liveness_status=0
+      else
+        old_liveness_status="$?"
+      fi
+      if [[ "$old_liveness_status" == "2" ]]; then
+        reconciliation_control_kind="$(runtime_tmux_outcome_kind)"
+        fail_tmux_control "$reconciliation_control_kind" "$TMUX_CONTROL_RETRYABLE" \
+          "tmux control failed while reconciling consultant session state: $old_session"
+      fi
+      if [[ "$old_liveness_status" == "0" ]]; then
+        if pane_target_for_session_checked "$old_session" "$old_pane"; then
+          old_pane="$TMUX_RESOLVED_PANE"
+        else
+          old_pane_status="$?"
+          if [[ "$old_pane_status" == "2" ]]; then
+            reconciliation_control_kind="$(runtime_tmux_outcome_kind)"
+            fail_tmux_control "$reconciliation_control_kind" "$TMUX_CONTROL_RETRYABLE" \
+              "tmux control failed while resolving the recorded consultant pane: $old_session"
+          fi
+          old_pane=""
+        fi
+      fi
     fi
     old_sentinel="$(read_json_field "$state_file" done_sentinel)"
     old_response="$(read_json_field "$state_file" last_response)"
@@ -987,14 +1447,23 @@ cmd_send() {
     old_model="$(read_json_field "$state_file" requested_model)"
     old_launcher="$(read_json_field "$state_file" claude_launcher)"
     old_effort="$(read_json_field "$state_file" claude_effort)"
-    if [[ -n "$old_session" ]] && session_exists "$old_session"; then
+    if [[ -n "$old_session" && "$old_liveness_status" == "0" ]]; then
       if [[ "$old_model" != "$requested_model" || "$old_launcher" != "$claude_launcher" || "$old_effort" != "$requested_effort" ]] &&
          [[ "$fresh" != "true" || "$replace" != "true" ]]; then
         die "live session launcher/model/effort differs from this request; use --fresh --replace"
       fi
     fi
-    if [[ "$old_busy" == "true" && -n "$old_session" && -n "$old_sentinel" ]] && session_exists "$old_session"; then
-      if [[ -n "$old_pane" ]] && printf '%s' "$(capture_pane_text "$old_pane" 240)" | rg -Fq "$old_sentinel" && response_file_is_fresh "$old_response" "${old_started:-0}"; then
+    if [[ "$old_busy" == "true" && -n "$old_session" && -n "$old_sentinel" && "$old_liveness_status" == "0" ]]; then
+      if [[ -n "$old_pane" ]]; then
+        if capture_pane_text_checked "$old_pane" 240; then
+          old_capture_text="$TMUX_CAPTURE_TEXT"
+        else
+          reconciliation_control_kind="$(runtime_tmux_outcome_kind)"
+          fail_tmux_control "$reconciliation_control_kind" "$TMUX_CONTROL_RETRYABLE" \
+            "tmux control failed while reconciling the recorded consultant response: $old_session"
+        fi
+      fi
+      if [[ -n "$old_pane" ]] && printf '%s' "$old_capture_text" | rg -Fq "$old_sentinel" && response_file_is_fresh "$old_response" "${old_started:-0}"; then
         write_state "$state_file" "$provider" "$old_key" "$project_slug" "$old_session" "$old_pane" "$resolved" "$(read_json_field "$state_file" last_packet)" "live" "$(read_json_field "$state_file" release_policy)" "$(read_json_field "$state_file" ttl)" "$old_response" "false" "${old_started:-$(date +%s)}" "$(date +%s)" "$old_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
       else
         now_epoch="$(date +%s)"
@@ -1003,18 +1472,39 @@ cmd_send() {
         fi
         die "consultant session is busy; wait for completion, inspect with capture/attach, or release it: $old_session"
       fi
-    elif [[ "$old_busy" == "true" && -n "$old_session" ]] && ! session_exists "$old_session"; then
+    elif [[ "$old_busy" == "true" && -n "$old_session" && "$old_liveness_status" == "1" ]]; then
       log_event "missing_busy_session" "$provider" "$old_session" "missing" "$state_file"
     fi
   fi
 
-  if session_exists "$session"; then
+  local session_liveness_status=1 replacement_status replacement_control_kind
+  if tmux_session_liveness "$session"; then
+    session_liveness_status=0
+  else
+    session_liveness_status="$?"
+  fi
+  if [[ "$session_liveness_status" == "2" ]]; then
+    replacement_control_kind="$(runtime_tmux_outcome_kind)"
+    fail_tmux_control "$replacement_control_kind" "$TMUX_CONTROL_RETRYABLE" \
+      "tmux control failed while checking the requested consultant session: $session"
+  fi
+  if [[ "$session_liveness_status" == "0" ]]; then
     if [[ "$fresh" == "true" && "$replace" != "true" ]]; then
       die "live session exists for key '$key'; run release first or pass --replace"
     fi
     if [[ "$fresh" == "true" && "$replace" == "true" ]]; then
-      tmux kill-session -t "$session" 2>/dev/null || true
+      if kill_tmux_session_checked "$session"; then
+        replacement_status=0
+      else
+        replacement_status="$?"
+      fi
+      if [[ "$replacement_status" == "2" ]]; then
+        replacement_control_kind="$(runtime_tmux_outcome_kind)"
+        fail_tmux_control "$replacement_control_kind" "$TMUX_CONTROL_RETRYABLE" \
+          "tmux control failed while replacing consultant session: $session"
+      fi
       log_event "replace" "$provider" "$session" "released" "$state_file"
+      session_liveness_status=1
     elif [[ "$reuse" != "true" ]]; then
       die "live session exists and --reuse is disabled"
     fi
@@ -1022,21 +1512,77 @@ cmd_send() {
 
   write_packet "$packet" "$provider" "$task" "$resolved" "$owner_prompt" "$response" "$done_sentinel" "${materials[@]-}"
 
-  if ! session_exists "$session"; then
-    tmux new-session -d -s "$session" -c "$resolved" "$launch_cmd" 9>&-
+  if [[ "$session_liveness_status" == "1" ]]; then
+    if ! tmux_control_command new-session -d -s "$session" -c "$resolved" "$launch_cmd" 9>&-; then
+      write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$(date +%s)" "$(date +%s)" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
+      log_event "tmux_session_create_failed" "$provider" "$session" "failed" "control_kind=$TMUX_CONTROL_KIND exit=$TMUX_CONTROL_EXIT"
+      fail_tmux_control "tmux_session_create_failed" "$TMUX_CONTROL_RETRYABLE" \
+        "tmux could not create consultant session: $session"
+    fi
     log_event "launch" "$provider" "$session" "live" "$launch_cmd"
+    local launch_recorded_epoch
+    launch_recorded_epoch="$(date +%s)"
+    write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "" "$resolved" "$packet" "live" "$release_policy" "$ttl" "$response" "false" "$launch_recorded_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
   fi
-  pane="$(pane_target_for_session "$session" || true)"
-  [[ -n "$pane" ]] || die "consultant session has no addressable pane: $session"
+  local pane_status=0 pane_failure_kind
+  if pane_target_for_session_checked "$session"; then
+    pane="$TMUX_RESOLVED_PANE"
+  else
+    pane_status="$?"
+    if [[ "$pane_status" == "2" ]]; then
+      pane_failure_kind="$(runtime_tmux_outcome_kind)"
+      log_event "$pane_failure_kind" "$provider" "$session" "failed" "pane_resolution control_kind=$TMUX_CONTROL_KIND exit=$TMUX_CONTROL_EXIT"
+      fail_tmux_control "$pane_failure_kind" "$TMUX_CONTROL_RETRYABLE" \
+        "tmux control failed while resolving the consultant pane: $session"
+    fi
+    write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$(date +%s)" "$(date +%s)" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
+    log_event "tmux_session_missing" "$provider" "$session" "failed" "no_addressable_pane"
+    fail_outcome "tmux_session_missing" "true" \
+      "consultant session has no addressable pane: $session"
+  fi
+
+  local ready_epoch
+  ready_epoch="$(date +%s)"
+  write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "live" "$release_policy" "$ttl" "$response" "false" "$ready_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
 
   local ready_status=0
-  if wait_for_ready "$provider" "$stub" "$pane" "$ready_timeout" "$auto_trust"; then
+  if wait_for_ready "$provider" "$stub" "$session" "$pane" "$ready_timeout" "$auto_trust"; then
     ready_status=0
   else
     ready_status="$?"
-    write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$(date +%s)" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
-    log_event "ready_timeout" "$provider" "$session" "failed" "exit=$ready_status"
-    die "consultant did not become ready; inspect with: tmux attach -t $session"
+    case "$ready_status" in
+      1)
+        write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$ready_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
+        log_event "provider_not_ready" "$provider" "$session" "failed" "timeout=${ready_timeout}s"
+        fail_outcome "provider_not_ready" "true" \
+          "consultant did not become ready within ${ready_timeout}s; inspect with: tmux attach -t $session"
+        ;;
+      2)
+        write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$ready_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
+        log_event "provider_interaction_required" "$provider" "$session" "blocked" "trust_or_hooks_prompt"
+        fail_outcome "provider_interaction_required" "true" \
+          "consultant requires an explicit trust or hooks decision; inspect with: tmux attach -t $session"
+        ;;
+      3)
+        write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$ready_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
+        log_event "provider_process_exited" "$provider" "$session" "failed" "before_ready"
+        fail_outcome "provider_process_exited" "true" \
+          "consultant session exited before becoming ready: $session"
+        ;;
+      5)
+        local readiness_control_kind
+        readiness_control_kind="$(runtime_tmux_outcome_kind)"
+        log_event "$readiness_control_kind" "$provider" "$session" "failed" "before_ready control_kind=$TMUX_CONTROL_KIND exit=$TMUX_CONTROL_EXIT"
+        fail_tmux_control "$readiness_control_kind" "$TMUX_CONTROL_RETRYABLE" \
+          "tmux control failed while waiting for consultant readiness"
+        ;;
+      *)
+        write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$ready_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
+        log_event "provider_readiness_failed" "$provider" "$session" "failed" "exit=$ready_status"
+        fail_outcome "provider_readiness_failed" "true" \
+          "consultant readiness failed unexpectedly (exit $ready_status)"
+        ;;
+    esac
   fi
 
   local send_epoch
@@ -1044,7 +1590,23 @@ cmd_send() {
   rm -f "$response"
   write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "live" "$release_policy" "$ttl" "$response" "true" "$send_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
   short_prompt="ASK_TMUX_RESPONSE=$response ASK_TMUX_SENTINEL=$done_sentinel Read and follow this review packet: $packet . Task: $owner_prompt . When complete, write your full response to the ASK_TMUX_RESPONSE path and print only the ASK_TMUX_SENTINEL value on its own final line."
-  send_prompt_to_pane "$pane" "$short_prompt" "$provider" "ASK_TMUX_RESPONSE=$response"
+  local delivery_status=0
+  if send_prompt_to_pane "$pane" "$short_prompt" "$provider" "ASK_TMUX_RESPONSE=$response"; then
+    delivery_status=0
+  else
+    delivery_status="$?"
+    if [[ "$delivery_status" == "2" ]]; then
+      log_event "tmux_prompt_delivery_unconfirmed" "$provider" "$session" "busy" \
+        "phase=$TMUX_PROMPT_DELIVERY_PHASE control_kind=$TMUX_CONTROL_KIND exit=$TMUX_CONTROL_EXIT"
+      fail_tmux_control "tmux_prompt_delivery_unconfirmed" "false" \
+        "the consultant prompt may have been accepted, but tmux could not confirm delivery; inspect the live pane before any retry: $pane"
+    fi
+    write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$send_epoch" "$(date +%s)" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
+    log_event "tmux_prompt_delivery_failed" "$provider" "$session" "failed" \
+      "phase=$TMUX_PROMPT_DELIVERY_PHASE control_kind=$TMUX_CONTROL_KIND exit=$TMUX_CONTROL_EXIT"
+    fail_tmux_control "tmux_prompt_delivery_failed" "$TMUX_CONTROL_RETRYABLE" \
+      "tmux could not deliver the consultant prompt to pane: $pane"
+  fi
   log_event "send" "$provider" "$session" "sent" "$packet"
 
   info "sent provider=$provider session=$session pane=$pane"
@@ -1055,7 +1617,7 @@ cmd_send() {
 
   if [[ "$wait" == "true" ]]; then
     local done_rc
-    if wait_for_done "$pane" "$done_sentinel" "$response" "$wait_timeout" "$send_epoch" "$provider"; then
+    if wait_for_done "$session" "$pane" "$done_sentinel" "$response" "$wait_timeout" "$send_epoch" "$provider"; then
       write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "live" "$release_policy" "$ttl" "$response" "false" "$send_epoch" "$(date +%s)" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
       log_event "done" "$provider" "$session" "complete" "$response"
       info "done_sentinel=$done_sentinel"
@@ -1067,23 +1629,34 @@ cmd_send() {
       case "$done_rc" in
         1)
           write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$send_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
-          log_event "session_exited" "$provider" "$session" "failed" "$response"
-          die "consultant session exited before done sentinel"
+          log_event "provider_process_exited" "$provider" "$session" "failed" "$response"
+          fail_outcome "provider_process_exited" "true" \
+            "consultant session exited before done sentinel"
           ;;
         2)
           write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "live" "$release_policy" "$ttl" "$response" "true" "$send_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
-          log_event "wait_timeout" "$provider" "$session" "busy" "$response"
-          die "timed out waiting ${wait_timeout}s for done sentinel; inspect with capture/attach"
+          log_event "provider_completion_timeout" "$provider" "$session" "busy" "$response"
+          fail_outcome "provider_completion_timeout" "true" \
+            "timed out waiting ${wait_timeout}s for done sentinel; inspect with capture/attach"
           ;;
         3)
           write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$send_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
-          log_event "missing_response" "$provider" "$session" "failed" "$response"
-          die "done sentinel appeared but response file is missing: $response"
+          log_event "provider_response_missing" "$provider" "$session" "failed" "$response"
+          fail_outcome "provider_response_missing" "false" \
+            "done sentinel appeared but response file is missing: $response"
           ;;
         4)
           write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$send_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
           log_event "provider_gateway_timeout_524" "$provider" "$session" "failed" "$response"
-          die "Claude provider gateway returned API Error 524 before completion. The gateway's 120-second origin timeout is shorter than this request's model latency; increasing --wait-timeout will not help. Split the task, request a concise response, lower Claude effort, or use a provider route with a longer streaming timeout."
+          fail_outcome "provider_gateway_timeout_524" "false" \
+            "Claude provider gateway returned API Error 524 before completion. The gateway's 120-second origin timeout is shorter than this request's model latency; increasing --wait-timeout will not help. Split the task, request a concise response, lower Claude effort, or use a provider route with a longer streaming timeout."
+          ;;
+        5)
+          local completion_control_kind
+          completion_control_kind="$(runtime_tmux_outcome_kind)"
+          log_event "$completion_control_kind" "$provider" "$session" "failed" "during_completion control_kind=$TMUX_CONTROL_KIND exit=$TMUX_CONTROL_EXIT"
+          fail_tmux_control "$completion_control_kind" "$TMUX_CONTROL_RETRYABLE" \
+            "tmux control failed while waiting for consultant completion"
           ;;
         *)
           die "unexpected wait failure: $done_rc"
@@ -1097,7 +1670,17 @@ cmd_send() {
 
   case "$release_policy" in
     now)
-      tmux kill-session -t "$session" 2>/dev/null || true
+      local release_now_status release_now_control_kind
+      if kill_tmux_session_checked "$session"; then
+        release_now_status=0
+      else
+        release_now_status="$?"
+      fi
+      if [[ "$release_now_status" == "2" ]]; then
+        release_now_control_kind="$(runtime_tmux_outcome_kind)"
+        fail_tmux_control "$release_now_control_kind" "$TMUX_CONTROL_RETRYABLE" \
+          "tmux control failed while applying release policy now: $session"
+      fi
       write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "released" "$release_policy" "$ttl" "$response" "false" "$send_epoch" "$(date +%s)" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
       log_event "release_now" "$provider" "$session" "released" "$state_file"
       info "released session=$session"
@@ -1107,11 +1690,7 @@ cmd_send() {
   esac
 
   if [[ "$attach" == "true" ]]; then
-    if [[ -t 1 ]]; then
-      exec tmux attach -t "$session"
-    else
-      info "attach_command=tmux attach -t $session"
-    fi
+    attach_tmux_session "$session" "attach_command"
   fi
 }
 
@@ -1130,6 +1709,7 @@ cmd_status() {
     esac
   done
   local project_filter file session status last packet response busy completed sentinel pane started
+  local liveness_status pane_status capture_text status_control_kind
   project_filter="$(project_slug_for_optional_cwd "$cwd" "$cwd_mode")"
   for file in $(find_state_files "$provider" "$key" "$all" "$project_filter"); do
     session="$(read_json_field "$file" session_name)"
@@ -1141,10 +1721,43 @@ cmd_status() {
     pane="$(read_json_field "$file" pane_target)"
     started="$(read_json_number "$file" started_epoch)"
     last="$(read_json_number "$file" last_used_epoch)"
-    if [[ -n "$session" ]] && session_exists "$session"; then
-      pane="$(pane_target_for_session "$session" "$pane" || true)"
+    liveness_status=1
+    if [[ -n "$session" ]]; then
+      if tmux_session_liveness "$session"; then
+        liveness_status=0
+      else
+        liveness_status="$?"
+      fi
+      if [[ "$liveness_status" == "2" ]]; then
+        status_control_kind="$(runtime_tmux_outcome_kind)"
+        fail_tmux_control "$status_control_kind" "$TMUX_CONTROL_RETRYABLE" \
+          "tmux control failed while checking consultant status: $session"
+      fi
+    fi
+    if [[ -n "$session" && "$liveness_status" == "0" ]]; then
+      if pane_target_for_session_checked "$session" "$pane"; then
+        pane="$TMUX_RESOLVED_PANE"
+      else
+        pane_status="$?"
+        if [[ "$pane_status" == "2" ]]; then
+          status_control_kind="$(runtime_tmux_outcome_kind)"
+          fail_tmux_control "$status_control_kind" "$TMUX_CONTROL_RETRYABLE" \
+            "tmux control failed while resolving consultant status pane: $session"
+        fi
+        pane=""
+      fi
       if [[ "$busy" == "true" ]]; then
-        if [[ -n "$pane" && -n "$sentinel" && -n "$response" ]] && printf '%s' "$(capture_pane_text "$pane" 240)" | rg -Fq "$sentinel" && response_file_is_fresh "$response" "${started:-0}"; then
+        capture_text=""
+        if [[ -n "$pane" && -n "$sentinel" && -n "$response" ]]; then
+          if capture_pane_text_checked "$pane" 240; then
+            capture_text="$TMUX_CAPTURE_TEXT"
+          else
+            status_control_kind="$(runtime_tmux_outcome_kind)"
+            fail_tmux_control "$status_control_kind" "$TMUX_CONTROL_RETRYABLE" \
+              "tmux control failed while capturing consultant status: $session"
+          fi
+        fi
+        if [[ -n "$pane" && -n "$sentinel" && -n "$response" ]] && printf '%s' "$capture_text" | rg -Fq "$sentinel" && response_file_is_fresh "$response" "${started:-0}"; then
           local provider_name key_name project_slug cwd release_policy ttl now_epoch
           provider_name="$(read_json_field "$file" provider)"
           key_name="$(read_json_field "$file" key)"
@@ -1213,11 +1826,40 @@ cmd_capture() {
     esac
   done
   [[ -n "$key" ]] || die "--key is required for capture"
-  local file session out artifact_file
+  local file session pane out artifact_file liveness_status pane_status capture_control_kind
   file="$(select_state_file_for_key "$provider" "$key" "$cwd" "$cwd_mode" "capture")"
   session="$(read_json_field "$file" session_name)"
-  session_exists "$session" || die "session is not live: $session"
-  out="$(tmux capture-pane -t "$session" -p -S "-$lines")"
+  pane="$(read_json_field "$file" pane_target)"
+  if tmux_session_liveness "$session"; then
+    :
+  else
+    liveness_status="$?"
+    if [[ "$liveness_status" == "1" ]]; then
+      die "session is not live: $session"
+    fi
+    capture_control_kind="$(runtime_tmux_outcome_kind)"
+    fail_tmux_control "$capture_control_kind" "$TMUX_CONTROL_RETRYABLE" \
+      "tmux control failed while checking capture target: $session"
+  fi
+  if pane_target_for_session_checked "$session" "$pane"; then
+    pane="$TMUX_RESOLVED_PANE"
+  else
+    pane_status="$?"
+    if [[ "$pane_status" == "2" ]]; then
+      capture_control_kind="$(runtime_tmux_outcome_kind)"
+      fail_tmux_control "$capture_control_kind" "$TMUX_CONTROL_RETRYABLE" \
+        "tmux control failed while resolving capture pane: $session"
+    fi
+    fail_outcome "tmux_pane_missing" "true" \
+      "consultant session has no addressable pane: $session"
+  fi
+  if capture_pane_text_checked "$pane" "$lines"; then
+    out="$TMUX_CAPTURE_TEXT"
+  else
+    capture_control_kind="$(runtime_tmux_outcome_kind)"
+    fail_tmux_control "$capture_control_kind" "$TMUX_CONTROL_RETRYABLE" \
+      "tmux control failed while capturing consultant pane: $pane"
+  fi
   if [[ "$artifact" == "true" ]]; then
     mkdir -p "$ARTIFACT_ROOT"
     artifact_file="$ARTIFACT_ROOT/$(date +%Y%m%dT%H%M%S)-${session}.txt"
@@ -1240,15 +1882,21 @@ cmd_attach() {
     esac
   done
   [[ -n "$key" ]] || die "--key is required for attach"
-  local file session
+  local file session liveness_status attach_control_kind
   file="$(select_state_file_for_key "$provider" "$key" "$cwd" "$cwd_mode" "attach")"
   session="$(read_json_field "$file" session_name)"
-  session_exists "$session" || die "session is not live: $session"
-  if [[ -t 1 ]]; then
-    exec tmux attach -t "$session"
+  if tmux_session_liveness "$session"; then
+    :
   else
-    info "tmux attach -t $session"
+    liveness_status="$?"
+    if [[ "$liveness_status" == "1" ]]; then
+      die "session is not live: $session"
+    fi
+    attach_control_kind="$(runtime_tmux_outcome_kind)"
+    fail_tmux_control "$attach_control_kind" "$TMUX_CONTROL_RETRYABLE" \
+      "tmux control failed while checking attach target: $session"
   fi
+  attach_tmux_session "$session"
 }
 
 cmd_release() {
@@ -1266,6 +1914,7 @@ cmd_release() {
   done
   [[ "$all" == "true" || -n "$key" ]] || die "release requires --key or --all"
   local project_filter preferred files=() file session pane packet state_cwd project_slug response sentinel key_name provider_name release_policy ttl started
+  local release_status release_control_kind
   project_filter="$(project_slug_for_optional_cwd "$cwd" "$cwd_mode")"
   if [[ "$all" == "true" ]]; then
     read_state_files_into_array files "$provider" "" true "$project_filter"
@@ -1301,7 +1950,16 @@ cmd_release() {
     ttl="$(read_json_field "$file" ttl)"
     started="$(read_json_number "$file" started_epoch)"
     if [[ -n "$session" ]]; then
-      tmux kill-session -t "$session" 2>/dev/null || true
+      if kill_tmux_session_checked "$session"; then
+        release_status=0
+      else
+        release_status="$?"
+      fi
+      if [[ "$release_status" == "2" ]]; then
+        release_control_kind="$(runtime_tmux_outcome_kind)"
+        fail_tmux_control "$release_control_kind" "$TMUX_CONTROL_RETRYABLE" \
+          "tmux control failed while releasing consultant session: $session"
+      fi
       info "released session=$session"
       write_state "$file" "$provider_name" "$key_name" "${project_slug:-unknown}" "$session" "$pane" "${state_cwd:-$PWD}" "$packet" "released" "${release_policy:-manual}" "$ttl" "$response" "false" "${started:-$(date +%s)}" "$(date +%s)" "$sentinel"
       log_event "release" "$provider_name" "$session" "released" "$file"
@@ -1312,6 +1970,7 @@ cmd_release() {
 
 cmd_cleanup() {
   local provider="" stale_after="24h" now cutoff file last session pane packet cwd project_slug key_name busy
+  local cleanup_status cleanup_control_kind
   provider="$(invoked_provider)"
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1341,12 +2000,31 @@ cmd_cleanup() {
       sentinel="$(read_json_field "$file" done_sentinel)"
       started="$(read_json_number "$file" started_epoch)"
       provider_name="${provider:-$(read_json_field "$file" provider)}"
-      if [[ "$busy" == "true" ]] && session_exists "$session"; then
-        info "skip busy stale live session state=$file"
-        flock -u 9 || true
-        continue
+      if [[ "$busy" == "true" ]]; then
+        if tmux_session_liveness "$session"; then
+          info "skip busy stale live session state=$file"
+          flock -u 9 || true
+          continue
+        else
+          cleanup_status="$?"
+        fi
+        if [[ "$cleanup_status" == "2" ]]; then
+          cleanup_control_kind="$(runtime_tmux_outcome_kind)"
+          fail_tmux_control "$cleanup_control_kind" "$TMUX_CONTROL_RETRYABLE" \
+            "tmux control failed while checking stale busy session: $session"
+        fi
+      else
+        if kill_tmux_session_checked "$session"; then
+          cleanup_status=0
+        else
+          cleanup_status="$?"
+        fi
+        if [[ "$cleanup_status" == "2" ]]; then
+          cleanup_control_kind="$(runtime_tmux_outcome_kind)"
+          fail_tmux_control "$cleanup_control_kind" "$TMUX_CONTROL_RETRYABLE" \
+            "tmux control failed while cleaning stale consultant session: $session"
+        fi
       fi
-      tmux kill-session -t "$session" 2>/dev/null || true
       write_state "$file" "$provider_name" "$key_name" "${project_slug:-unknown}" "$session" "$pane" "${cwd:-$PWD}" "$packet" "released" "ttl" "$stale_after" "$response" "false" "${started:-$(date +%s)}" "$(date +%s)" "$sentinel"
       log_event "cleanup" "$provider_name" "$session" "released" "$file"
       info "cleaned stale session=$session"
@@ -1355,8 +2033,39 @@ cmd_cleanup() {
   done
 }
 
+cmd_preflight() {
+  local json_output="false" provider="" report probe_status kind
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --json) json_output="true"; shift ;;
+      --provider) provider="$2"; shift 2 ;;
+      *) die "unknown preflight option: $1" ;;
+    esac
+  done
+  if [[ -n "$provider" && "$provider" != "claude" && "$provider" != "codex" ]]; then
+    die "provider must be claude or codex"
+  fi
+  if report="$(tmux_preflight_json)"; then
+    probe_status=0
+  else
+    probe_status=$?
+  fi
+  if [[ "$json_output" == "true" ]]; then
+    printf '%s\n' "$report"
+  else
+    kind="$(preflight_json_field "$report" kind)"
+    if [[ "$probe_status" == "0" ]]; then
+      info "PASS tmux_control=$kind"
+    else
+      info "FAIL tmux_control=$kind"
+      info "tmux_stderr=$(preflight_json_field "$report" stderr)"
+    fi
+  fi
+  return "$probe_status"
+}
+
 cmd_doctor() {
-  local provider="" failed=0
+  local provider="" failed=0 tmux_report tmux_status tmux_kind tmux_version
   provider="$(invoked_provider)"
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -1365,7 +2074,20 @@ cmd_doctor() {
     esac
   done
 	  info "ask-tmux-consultant version=$VERSION"
-	  if command -v tmux >/dev/null; then info "PASS tmux=$(tmux -V)"; else info "FAIL tmux missing"; failed=1; fi
+    if tmux_report="$(tmux_preflight_json)"; then
+      tmux_status=0
+    else
+      tmux_status=$?
+    fi
+    tmux_kind="$(preflight_json_field "$tmux_report" kind)"
+    tmux_version="$(preflight_json_field "$tmux_report" tmux.version)"
+    if [[ "$tmux_status" == "0" ]]; then
+      info "PASS tmux_control=$tmux_kind"
+    else
+      info "FAIL tmux_control=$tmux_kind"
+      failed=1
+    fi
+    [[ -n "$tmux_version" ]] && info "INFO tmux_version=$tmux_version"
 	  if [[ "${ASK_TMUX_RG_FALLBACK:-}" == "grep" ]]; then info "PASS rg=fallback-grep"; elif command -v rg >/dev/null; then info "PASS rg=$(command -v rg)"; else info "FAIL rg missing"; failed=1; fi
 	  if command -v flock >/dev/null; then info "PASS flock=$(command -v flock)"; else info "FAIL flock missing"; failed=1; fi
 	  if command -v python3 >/dev/null; then info "PASS python3=$(command -v python3)"; else info "FAIL python3 missing"; failed=1; fi
@@ -1400,6 +2122,7 @@ main() {
     release) cmd_release "$@" ;;
     cleanup) cmd_cleanup "$@" ;;
     gc) cmd_cleanup "$@" ;;
+    preflight) cmd_preflight "$@" ;;
     doctor) cmd_doctor "$@" ;;
     -h|--help|help) usage ;;
     *) die "unknown command: $command" ;;

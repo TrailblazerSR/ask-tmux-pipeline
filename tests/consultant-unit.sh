@@ -22,10 +22,14 @@ assert_not_ready() {
   fi
 }
 
+original_tmux_function="$(declare -f tmux)"
 tmux() {
   case "$1" in
     display-message)
-      [[ "$*" == *'%42'* ]] || return 1
+      if [[ "$*" != *'%42'* ]]; then
+        printf '%s\n' "can't find pane: ${3:-unknown}" >&2
+        return 1
+      fi
       printf '%%42\n'
       ;;
     list-panes)
@@ -37,11 +41,16 @@ tmux() {
   esac
 }
 
-[[ "$(pane_target_for_session test-session)" == '%42' ]] || fail "should discover tmux pane IDs without assuming window 0"
-[[ "$(pane_target_for_session test-session '%42')" == '%42' ]] || fail "should preserve a valid recorded pane ID"
-if pane_target_for_session test-session 'test-session:0.0' | grep -q '0.0'; then
-  fail "should replace invalid legacy pane targets"
-fi
+pane_target_for_session_checked test-session \
+  || fail "should discover tmux pane IDs without assuming window 0"
+[[ "$TMUX_RESOLVED_PANE" == '%42' ]] || fail "should retain the discovered stable pane ID"
+pane_target_for_session_checked test-session '%42' \
+  || fail "should preserve a valid recorded pane ID"
+[[ "$TMUX_RESOLVED_PANE" == '%42' ]] || fail "should retain a valid recorded pane ID"
+pane_target_for_session_checked test-session 'test-session:0.0' \
+  || fail "should recover from an invalid legacy pane target"
+[[ "$TMUX_RESOLVED_PANE" == '%42' ]] || fail "should replace invalid legacy pane targets"
+eval "$original_tmux_function"
 
 trust_plus_banner_no_composer='
 > You are in /tmp/project
@@ -156,31 +165,55 @@ assert_ready codex "$ready_with_stale_trust"
 assert_ready claude "$claude_ready_with_status"
 text_contains_sentinel "$wrapped_sentinel" "$sentinel" || fail "wrapped sentinel was not detected"
 
-original_session_exists="$(declare -f session_exists)"
-original_capture_pane_text="$(declare -f capture_pane_text)"
+original_tmux_session_liveness="$(declare -f tmux_session_liveness)"
+original_tmux_control_command="$(declare -f tmux_control_command)"
+identity_session_fixture="$(mktemp /tmp/ask-tmux-identity-session.XXXXXX)"
+identity_pane_fixture="$(mktemp /tmp/ask-tmux-identity-pane.XXXXXX)"
+tmux_session_liveness() {
+  printf '%s\n' "$1" > "$identity_session_fixture"
+  return 0
+}
+tmux_control_command() {
+  [[ "$1" == "capture-pane" ]] || return 1
+  printf '%s\n' "$4" > "$identity_pane_fixture"
+  TMUX_CONTROL_STDOUT="ASK_TMUX_STUB_READY"
+  TMUX_CONTROL_EXIT=0
+  return 0
+}
+wait_for_ready codex true fixture-session %42 0 false \
+  || fail "stub readiness should succeed"
+[[ "$(sed -n '1p' "$identity_session_fixture")" == "fixture-session" ]] \
+  || fail "readiness must check liveness with the session name"
+[[ "$(sed -n '1p' "$identity_pane_fixture")" == "%42" ]] \
+  || fail "readiness must capture with the stable pane ID"
+rm -f "$identity_session_fixture" "$identity_pane_fixture"
+
 provider_timeout_fixture="$(mktemp /tmp/ask-tmux-provider-timeout.XXXXXX)"
 rm -f "$provider_timeout_fixture"
-session_exists() { return 0; }
-capture_pane_text() {
+tmux_session_liveness() { return 0; }
+tmux_control_command() {
+  [[ "$1" == "capture-pane" ]] || return 1
+  TMUX_CONTROL_EXIT=0
   if [[ -e "$provider_timeout_fixture" ]]; then
-    printf '⎿ API Error: 524\nCloudflare origin did not return a complete response within the 120-second Proxy Read Timeout\n'
+    TMUX_CONTROL_STDOUT=$'⎿ API Error: 524\nCloudflare origin did not return a complete response within the 120-second Proxy Read Timeout'
   else
     : > "$provider_timeout_fixture"
-    printf 'Claude is working\n'
+    TMUX_CONTROL_STDOUT="Claude is working"
   fi
+  return 0
 }
-if wait_for_done "%fixture" "<<<DONE>>>" "/tmp/ask-tmux-no-response-fixture" 0 0 claude; then
+if wait_for_done "fixture-session" "%fixture" "<<<DONE>>>" "/tmp/ask-tmux-no-response-fixture" 0 0 claude; then
   provider_timeout_rc=0
 else
   provider_timeout_rc=$?
 fi
-if wait_for_done "%fixture" "<<<DONE>>>" "/tmp/ask-tmux-no-response-fixture" 0 0 claude; then
+if wait_for_done "fixture-session" "%fixture" "<<<DONE>>>" "/tmp/ask-tmux-no-response-fixture" 0 0 claude; then
   stale_provider_timeout_rc=0
 else
   stale_provider_timeout_rc=$?
 fi
-eval "$original_session_exists"
-eval "$original_capture_pane_text"
+eval "$original_tmux_session_liveness"
+eval "$original_tmux_control_command"
 rm -f "$provider_timeout_fixture"
 [[ "$provider_timeout_rc" == "4" ]] \
   || fail "Claude gateway API Error 524 should be classified as a provider failure"
@@ -199,10 +232,133 @@ fi
 codex_prompt_needs_second_submit "$unsent_text" "ASK_TMUX_RESPONSE=/tmp/response.md" || fail "unsent Codex prompt should need a second Enter"
 codex_prompt_needs_second_submit "$stale_activity_then_unsent_text" "ASK_TMUX_RESPONSE=/tmp/response.md" || fail "stale activity before an unsent prompt should not suppress second Enter"
 codex_prompt_needs_second_submit "$collapsed_unsent_text" "ASK_TMUX_RESPONSE=/tmp/response.md" || fail "collapsed pasted Codex prompt should need a second Enter"
+
+original_tmux_control_command="$(declare -f tmux_control_command)"
+delivery_call_log="$(mktemp /tmp/ask-tmux-delivery-calls.XXXXXX)"
+sleep() { :; }
+tmux_control_command() {
+  printf '%s\n' "$*" >> "$delivery_call_log"
+  TMUX_CONTROL_COMMAND="${1:-tmux}"
+  TMUX_CONTROL_EXIT=0
+  TMUX_CONTROL_STDOUT=""
+  TMUX_CONTROL_STDERR=""
+  TMUX_CONTROL_KIND=""
+  TMUX_CONTROL_RETRYABLE="true"
+  case "$1" in
+    set-buffer)
+      return 0
+      ;;
+    paste-buffer)
+      TMUX_CONTROL_EXIT=42
+      TMUX_CONTROL_STDERR="paste-buffer transport failed"
+      TMUX_CONTROL_KIND="tmux_control_failed"
+      return 1
+      ;;
+    delete-buffer)
+      return 0
+      ;;
+    *)
+      return 99
+      ;;
+  esac
+}
+set +e
+send_prompt_to_pane "%42" "fixture prompt" codex "fixture prompt"
+paste_failure_rc=$?
+set -e
+[[ "$paste_failure_rc" == "1" ]] || fail "pre-Enter paste failure should remain a definite delivery failure"
+grep -Fq 'delete-buffer -b ask-tmux-send-' "$delivery_call_log" \
+  || fail "paste failure should clean the named tmux buffer"
+[[ "$TMUX_CONTROL_EXIT" == "42" && "$TMUX_CONTROL_STDERR" == "paste-buffer transport failed" ]] \
+  || fail "buffer cleanup should preserve the original paste failure evidence"
+
+: > "$delivery_call_log"
+tmux_control_command() {
+  printf '%s\n' "$*" >> "$delivery_call_log"
+  TMUX_CONTROL_COMMAND="${1:-tmux}"
+  TMUX_CONTROL_EXIT=0
+  TMUX_CONTROL_STDOUT=""
+  TMUX_CONTROL_STDERR=""
+  TMUX_CONTROL_KIND=""
+  TMUX_CONTROL_RETRYABLE="true"
+  case "$1" in
+    set-buffer|paste-buffer|send-keys)
+      return 0
+      ;;
+    capture-pane)
+      TMUX_CONTROL_EXIT=1
+      TMUX_CONTROL_STDERR="error connecting to /private/tmp/tmux-501/default (Operation not permitted)"
+      TMUX_CONTROL_KIND="tmux_socket_denied"
+      TMUX_CONTROL_RETRYABLE="false"
+      return 1
+      ;;
+    *)
+      return 99
+      ;;
+  esac
+}
+set +e
+send_prompt_to_pane "%42" "fixture prompt" codex "fixture prompt"
+accepted_unconfirmed_rc=$?
+set -e
+[[ "$accepted_unconfirmed_rc" == "2" ]] \
+  || fail "control loss after Enter should be accepted-but-unconfirmed"
+[[ "$TMUX_PROMPT_DELIVERY_PHASE" == "accepted_unconfirmed" ]] \
+  || fail "post-Enter control loss should expose the accepted-unconfirmed phase"
+[[ "$TMUX_CONTROL_KIND" == "tmux_socket_denied" ]] \
+  || fail "accepted-unconfirmed delivery should retain the underlying control evidence"
+eval "$original_tmux_control_command"
+unset -f sleep
+rm -f "$delivery_call_log"
+
 case "$codex_launch_cmd" in
   env\ PATH=*HOME=*codex\ --dangerously-bypass-approvals-and-sandbox) ;;
   *) fail "Codex launch should pass the runner PATH/HOME into tmux" ;;
 esac
+
+attach_tmux_fixture="$(mktemp /tmp/ask-tmux-attach-client.XXXXXX)"
+printf '%s\n' \
+  '#!/usr/bin/env bash' \
+  'if [[ "${1:-}" == "has-session" ]]; then' \
+  '  if [[ "${ATTACH_MODE:-live}" == "denied" ]]; then' \
+  '    printf "%s\n" "error connecting to /private/tmp/tmux-501/default (Operation not permitted)" >&2' \
+  '    exit 1' \
+  '  fi' \
+  '  exit 0' \
+  'fi' \
+  'exit 99' \
+  > "$attach_tmux_fixture"
+chmod +x "$attach_tmux_fixture"
+attach_state_root="$(mktemp -d /tmp/ask-tmux-attach-state.XXXXXX)"
+original_state_root="$STATE_ROOT"
+STATE_ROOT="$attach_state_root"
+attach_resolved_cwd="$(resolve_cwd /tmp current)"
+attach_project_slug="$(project_slug_from_path "$attach_resolved_cwd")"
+attach_key="configured-attach"
+attach_key_id="$(key_id_from_key "$attach_key")"
+attach_state_file="$(state_file_for codex "$attach_project_slug" "$attach_key_id")"
+write_state "$attach_state_file" codex "$attach_key" "$attach_project_slug" fixture-session %42 "$attach_resolved_cwd" /tmp/packet.md live manual "" /tmp/response.md false
+attach_display="$(
+  ASK_TMUX_TMUX_BIN="$attach_tmux_fixture" \
+    cmd_attach --provider codex --key "$attach_key" --cwd "$attach_resolved_cwd" --cwd-mode current
+)"
+[[ "$attach_display" == "$attach_tmux_fixture attach -t fixture-session" ]] \
+  || fail "attach command should resolve and display the configured tmux binary"
+set +e
+attach_denied_output="$(
+  ATTACH_MODE=denied \
+  ASK_TMUX_TMUX_BIN="$attach_tmux_fixture" \
+    cmd_attach --provider codex --key "$attach_key" --cwd "$attach_resolved_cwd" --cwd-mode current \
+    2>&1
+)"
+attach_denied_rc=$?
+set -e
+[[ "$attach_denied_rc" == "1" ]] || fail "attach control denial should fail"
+grep -Fqx 'ASK_TMUX_OUTCOME=tmux_runtime_socket_denied' <<<"$attach_denied_output" \
+  || fail "attach control denial should retain its typed runtime outcome"
+STATE_ROOT="$original_state_root"
+rm -f "$attach_tmux_fixture"
+rm -rf "$attach_state_root"
 
 gated_tmp="$(mktemp -d /tmp/ask-tmux-claude-gated-unit.XXXXXX)"
 gated_home="$gated_tmp/home"

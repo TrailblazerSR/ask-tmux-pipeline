@@ -65,8 +65,12 @@ ask-tmux-codex attach --key reviewer --cwd /path/to/project
 ask-tmux-codex release --key reviewer --cwd /path/to/project
 ask-tmux-codex cleanup --stale-after 24h
 ask-tmux-codex gc --stale-after 24h
+ask-tmux-codex preflight --json
 ask-tmux-codex doctor
 ```
+
+`preflight --json` is read-only and verifies tmux control access from the
+current caller before a live send.
 
 Use `--cwd` on `capture`, `attach`, and `release` whenever a generic key such as `reviewer` may exist in more than one project. The runner keeps same-key consultants separate by project and by a collision-safe key hash; ambiguous lifecycle commands fail instead of choosing or releasing the wrong session.
 

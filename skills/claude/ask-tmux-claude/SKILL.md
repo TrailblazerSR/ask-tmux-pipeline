@@ -53,8 +53,12 @@ ask-tmux-claude attach --key reviewer --cwd /path/to/project
 ask-tmux-claude release --key reviewer --cwd /path/to/project
 ask-tmux-claude cleanup --stale-after 24h
 ask-tmux-claude gc --stale-after 24h
+ask-tmux-claude preflight --json
 ask-tmux-claude doctor
 ```
+
+`preflight --json` is read-only and verifies tmux control access from the
+current caller before a live send.
 
 Reuse a live same-key session by default. Use `--key` as the consultant identity. Same-key sessions are separated by project and by a collision-safe key hash. Use `--cwd` with `capture`, `attach`, and `release` whenever the key could exist in multiple projects; ambiguous lifecycle commands fail instead of guessing. Use `--fresh` only for a new independent consultation; release first or pass `--replace` if a same-key session exists. State is global under `~/.omx/state/consultants/`; logs are under `~/.omx/consultants/log.jsonl`; packets and responses are project-local under `.omx/consultants/`. The canonical command is `ask-tmux-claude`; `ask-tux-claude` is only a typo-compatible wrapper.
 

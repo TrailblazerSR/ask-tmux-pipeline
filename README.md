@@ -33,9 +33,24 @@ The runner bootstraps Homebrew, GNU coreutils, user-local, and nvm paths when av
 
 The tools launch Claude/Codex with elevated local permissions, matching the local `ask-tmux` workflow they came from. Only send trusted materials.
 
-## Addressed Compatibility Issue
+## Reliability Model
 
-The consultant runner now handles the macOS failures where non-interactive sessions missed Homebrew paths, Bash 3 lacked `mapfile`, Claude/Codex prompts were pasted but not submitted reliably, and Codex startup could block on update/workspace-trust prompts before readiness detection. It also closes the state-lock file descriptor before launching tmux so long-lived sessions do not inherit and hold advisory locks.
+The consultant runner checks tmux control access from the actual caller before
+creating new request artifacts or launching a provider. It distinguishes socket denial, an
+absent server, protocol mismatch, provider readiness failure, provider exit,
+definite prompt-delivery failure, accepted-but-unconfirmed prompt delivery,
+missing response, completion timeout, and gateway timeout. Pipeline state
+retains the typed outcome, retryability, and evidence artifact instead of
+collapsing every failure into a generic transport error.
+
+The response protocol prefers a correlated, one-line
+`ask_tmux_pipeline.result.v2` JSON envelope. The legacy positional header
+format remains accepted during migration, and both formats must identify the
+expected pipeline stage.
+
+The runner also handles non-interactive Homebrew paths, Bash 3 environments,
+reliable prompt submission, Codex update/workspace-trust prompts, and inherited
+state-lock descriptors.
 
 ## Install
 
@@ -49,11 +64,31 @@ By default this installs:
 - Codex skills to `$HOME/.codex/skills`
 - Claude skills to `$HOME/.claude/skills`
 
-Each replaced script or skill directory is staged before activation and moved to
-`$HOME/.local/share/ask-tmux-pipeline/backups/` (or `ASK_TMUX_BACKUP_DIR`).
-Review that backup before deleting it. The installed Codex Claude-review skill
-routes automated sends through `ask-tmux-claude-gated`; reinstalling this
-repository must not restore direct raw-review guidance.
+The installer stages and validates the complete script-and-skill cohort before
+activation. It emits a canonical SHA-256 manifest and one deterministic
+`release_id`. Each normalized destination root reserves
+`.ask-tmux-pipeline-state/` for a root lock and a canonical `root-owner.json`
+bound to the exact three-root installation tuple. The successful owned-set
+ledger lives under
+`$BIN_DIR/.ask-tmux-pipeline-state/<install-id>/current-manifest.json`.
+Changing only `ASK_TMUX_BACKUP_DIR` therefore cannot fork ownership or bypass
+mutual exclusion; changing a destination root fails closed and requires an
+explicit coordinated migration. A later same-tuple install transactionally
+retires only previously owned targets absent from the new cohort; unrelated
+paths remain untouched. If a normal activation step fails, it restores every
+target already changed. Replaced or retired targets and the prior manifest
+remain together in a per-transaction directory under
+`$HOME/.local/share/ask-tmux-pipeline/backups/` (or
+`ASK_TMUX_BACKUP_DIR`). Review that backup before deleting it.
+
+This rollback is transactional for catchable installer failures; activation
+across three destination roots is not atomic against `SIGKILL`, power loss, or
+filesystem failure. Cooperative per-root locks prevent concurrent activation
+even when two tuples share only one destination root; a stale lock or
+conflicting root owner fails closed and requires inspection. The installed
+Codex Claude-review skill routes automated sends through
+`ask-tmux-claude-gated`; reinstalling this repository must not restore direct
+raw-review guidance.
 
 Override paths if needed:
 
@@ -62,6 +97,14 @@ BIN_DIR=/usr/local/bin CODEX_SKILLS_DIR=/path/to/codex/skills CLAUDE_SKILLS_DIR=
 ```
 
 ## Quick Guide
+
+Check caller-context tmux access without creating a session or calling a
+provider:
+
+```bash
+ask-tmux-claude preflight --json
+ask-tmux-codex-pipeline doctor
+```
 
 Review existing material with Claude:
 
@@ -307,10 +350,17 @@ flowchart TD
 ## Validation
 
 ```bash
-tests/smoke.sh
+bash tests/pipeline-unit.sh
+bash tests/preflight-unit.sh
+bash tests/consultant-unit.sh
+bash tests/provider-wrapper-unit.sh
+bash tests/install-unit.sh
+bash tests/smoke.sh
 ```
 
-The smoke test uses `--stub`, so it does not call live Claude or Codex.
+The tests do not call live Claude or Codex. The smoke test uses isolated tmux
+stub sessions and therefore requires the caller to have access to its tmux
+socket.
 
 ## Safety
 
@@ -323,6 +373,14 @@ The smoke test uses `--stub`, so it does not call live Claude or Codex.
   root digest, ordered stage digest, and fixed 24-hour grant. At most eight
   continuations are allowed. Unrelated pipelines still obey the daily caps and
   20-minute project cooldown.
+- A gate denial exits `76`, reports `outcome_kind=policy_deferred`, and records
+  `provider_started=false`. An initial denial has
+  `PIPELINE_STATUS=policy_deferred`; a denied continuation retains its
+  resumable pipeline status. This is an admission-policy outcome, not a tmux or
+  provider transport failure.
+- Exit `30` remains the migration-compatible umbrella for tmux/provider
+  failures. Read `outcome_kind` and, when present, `outcome_artifact` before
+  deciding whether to retry.
 - Prefer file-backed packets over pasted giant prompts.
 - Keep `--cwd` explicit.
 - Use `--pipeline-id` for `answer`, `review`, `status`, `resume`, and `final-context`.
