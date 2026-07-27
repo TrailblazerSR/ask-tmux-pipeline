@@ -1131,6 +1131,47 @@ codex_text_shows_activity() {
   printf '%s' "$text" | rg -q 'Working|Swooping|esc to interrupt|^[[:space:]]*(•|⏺|✻)'
 }
 
+codex_pane_is_ready() {
+  local text="$1" recent latest_codex_screen
+  recent="$(printf '%s\n' "$text" | tail -n 20)"
+
+  # A working pane can retain a composer and model footer. Keep the activity
+  # signals that unambiguously mean an in-flight response separate from the
+  # benign MCP-startup marker that Codex leaves in an otherwise ready pane.
+  if printf '%s' "$recent" | rg -q 'Working|Swooping|^[[:space:]]*(⏺|✻)'; then
+    return 1
+  fi
+
+  # Capture only the newest banner. An older ready screen must not hide a
+  # current model-loading screen, whose footer can already name a model.
+  latest_codex_screen="$(printf '%s\n' "$text" | awk '
+    /OpenAI Codex/ { screen = "" }
+    { screen = screen $0 ORS }
+    END { printf "%s", screen }
+  ')"
+  if printf '%s' "$latest_codex_screen" | rg -q 'model:[[:space:]]+loading([[:space:]]|$)'; then
+    return 1
+  fi
+
+  # Legacy Codex releases used an empty composer or a complete startup banner.
+  printf '%s' "$recent" | rg -q '(^|[[:space:]])(›|>)[[:space:]]*$|What can I help|Type /help|Ready' && return 0
+  if printf '%s' "$latest_codex_screen" | rg -q 'OpenAI Codex' \
+    && printf '%s' "$latest_codex_screen" | rg -q 'permissions:|YOLO mode' \
+    && printf '%s' "$latest_codex_screen" | rg -q 'model:[[:space:]]+(gpt-[[:alnum:]._-]+|codex-[[:alnum:]._-]+)([[:space:]]+[^[:space:]]+)*[[:space:]]+/model to change' \
+    && printf '%s' "$latest_codex_screen" | rg -q '^[[:space:]]*(gpt-[[:alnum:]._-]+|codex-[[:alnum:]._-]+)([[:space:]]+[^[:space:]]+)*[[:space:]]+·[[:space:]]+'; then
+    return 0
+  fi
+
+  # Codex 0.144+ fills an idle composer with rotating placeholder text, for
+  # example "› Write tests for @filename". Require an adjacent model/cwd
+  # footer so numbered trust/update choices are not accepted as ready.
+  if printf '%s' "$recent" | rg -q '^[[:space:]]*(›|>)[[:space:]]+[^[:space:]].*$' &&
+     printf '%s' "$recent" | rg -q '^[[:space:]]*(gpt-[[:alnum:]._-]+|codex-[[:alnum:]._-]+).*·[[:space:]]+(~|/)'; then
+    return 0
+  fi
+  return 1
+}
+
 send_prompt_to_pane() {
   local pane="$1" prompt="$2" provider="${3:-}" prompt_marker="${4:-$2}" buffer_name attempt text
   local failed_command failed_exit failed_stdout failed_stderr failed_kind failed_retryable
@@ -1191,20 +1232,7 @@ pane_is_ready() {
 	    printf '%s' "$text" | rg -q '(^|[[:space:]])(>|❯)[[:space:]]*$|bypass permissions on|What can I help|Type /help'
 	    ;;
 	  codex)
-	    printf '%s' "$text" | rg -q '(^|[[:space:]])(›|>)[[:space:]]*$|What can I help|Type /help|Ready' && return 0
-	    local latest_codex_screen
-	    latest_codex_screen="$(printf '%s\n' "$text" | awk '
-	      /OpenAI Codex/ { screen = "" }
-	      { screen = screen $0 ORS }
-	      END { printf "%s", screen }
-	    ')"
-	    if printf '%s' "$latest_codex_screen" | rg -q 'OpenAI Codex' \
-	      && printf '%s' "$latest_codex_screen" | rg -q 'permissions:|YOLO mode' \
-	      && printf '%s' "$latest_codex_screen" | rg -q 'model:[[:space:]]+(gpt-[[:alnum:]._-]+|codex-[[:alnum:]._-]+)([[:space:]]+[^[:space:]]+)*[[:space:]]+/model to change' \
-	      && printf '%s' "$latest_codex_screen" | rg -q '^[[:space:]]*(gpt-[[:alnum:]._-]+|codex-[[:alnum:]._-]+)([[:space:]]+[^[:space:]]+)*[[:space:]]+·[[:space:]]+'; then
-	      return 0
-	    fi
-	    return 1
+	    codex_pane_is_ready "$text"
 	    ;;
     *)
       return 1
