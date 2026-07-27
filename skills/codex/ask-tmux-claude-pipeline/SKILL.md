@@ -68,6 +68,8 @@ provider.
 
 The command prints stable markers. If it exits with code `10` and prints `PIPELINE_STATUS=waiting_for_user`, ask the user exactly the printed `question`, include `recommended_default` when present, and stop the current turn.
 
+At launch, `PIPELINE_STATUS=waiting_for_consultant` plus a `monitor=...` command means the tmux consultant is active but has not yet produced its final response. Poll that command instead of replacing the pipeline because an outer task runner has not streamed further output.
+
 The preferred consultant response starts with a one-line
 `ask_tmux_pipeline.result.v2` JSON envelope followed by one blank line. Its
 `stage` must match the requested stage. A `NEEDS_INPUT` result requires
@@ -122,7 +124,7 @@ The pipeline classifies Claude `API Error: 524` as
 providers, or retry the unchanged workload. Keep the default `high` unless the
 user explicitly chooses a smaller task or a lower one-off effort.
 
-Use `status`, `resume`, and `final-context` with `--pipeline-id` when recovering a pipeline. Treat `~/.omx/state/tmux-pipelines/current.json` as advisory only; if more than one pipeline may exist, use explicit `--pipeline-id` and `--cwd`.
+Use `status`, `resume`, and `final-context` with `--pipeline-id` when recovering a pipeline. Treat `~/.local/state/ask-tmux/tmux-pipelines/current.json` as advisory only; if more than one pipeline may exist, use explicit `--pipeline-id` and `--cwd`.
 
 ## Safety
 

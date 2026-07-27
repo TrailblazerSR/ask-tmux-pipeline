@@ -51,7 +51,7 @@ if ! command -v rg >/dev/null 2>&1; then
   }
 fi
 
-VERSION="0.3.0"
+VERSION="0.4.0"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 CLAUDE_PIPELINE_GATE_REASON="external_review_required"
 DEFAULT_CLAUDE_EFFORT="${ASK_TMUX_CLAUDE_EFFORT:-high}"
@@ -68,7 +68,10 @@ default_base_runner() {
 }
 
 BASE_RUNNER="${ASK_TMUX_CONSULTANT_RUNNER:-$(default_base_runner)}"
-PIPELINE_STATE_ROOT="${ASK_TMUX_PIPELINE_STATE_ROOT:-$HOME/.omx/state/tmux-pipelines}"
+ASK_TMUX_STATE_HOME="${ASK_TMUX_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/ask-tmux}"
+PIPELINE_STATE_ROOT="${ASK_TMUX_PIPELINE_STATE_ROOT:-$ASK_TMUX_STATE_HOME/tmux-pipelines}"
+LEGACY_PIPELINE_STATE_ROOT="$HOME/.omx/state/tmux-pipelines"
+PROJECT_ARTIFACT_DIR="${ASK_TMUX_PROJECT_ARTIFACT_DIR:-.ask-tmux}"
 
 usage() {
   cat <<'USAGE'
@@ -497,7 +500,7 @@ copy_state_indexes() {
 
 pipeline_paths() {
   local cwd="$1" provider="$2" pipeline_id="$3"
-  PIPELINE_DIR="$cwd/.omx/tmux-pipelines/$pipeline_id"
+  PIPELINE_DIR="$cwd/$PROJECT_ARTIFACT_DIR/tmux-pipelines/$pipeline_id"
   PIPELINE_STATE_FILE="$PIPELINE_DIR/state.json"
   PROJECT_SLUG="$(project_slug_from_path "$cwd")"
   CONSULTANT_KEY="pipeline-$pipeline_id"
@@ -791,7 +794,7 @@ run_consultant() {
   local claude_launcher="${16}" requested_model="${17}" requested_effort="${18}" gate_continuation="${19}"
   shift 19
   local materials=("$@")
-  local wrapper output_file response_file consultant_state output prompt
+  local wrapper output_file response_file consultant_state output prompt active_pipeline_id monitor_command
   local gate_fingerprint gate_root_digest gate_content_digest child_status failure_kind
   local child_retryable
   local policy_message policy_reason
@@ -831,6 +834,13 @@ run_consultant() {
   done
 
   state_set "$PIPELINE_STATE_FILE" "status=waiting_for_consultant" "last_stage=$stage"
+  active_pipeline_id="$(read_json_field "$PIPELINE_STATE_FILE" pipeline_id)"
+  printf -v monitor_command 'ask-tmux-%s-pipeline status --pipeline-id %q --cwd %q --cwd-mode current' \
+    "$provider" "$active_pipeline_id" "$cwd"
+  info "PIPELINE_STATUS=waiting_for_consultant" >&2
+  info "pipeline_id=$active_pipeline_id" >&2
+  info "stage=$stage" >&2
+  info "monitor=$monitor_command" >&2
   if output="$("${command_env[@]}" "${cmd[@]}" 2>&1)"; then
     child_status=0
   else
@@ -1082,20 +1092,30 @@ handle_response() {
 
 find_state_by_id() {
   local provider="$1" pipeline_id="$2" cwd="$3" cwd_mode="$4"
-  local resolved project_slug matches=()
+  local resolved project_slug state_root matches=() legacy_matches=()
   if [[ -n "$cwd" ]]; then
     resolved="$(resolve_cwd "$cwd" "$cwd_mode")"
+    if [[ -f "$resolved/$PROJECT_ARTIFACT_DIR/tmux-pipelines/$pipeline_id/state.json" ]]; then
+      printf '%s\n' "$resolved/$PROJECT_ARTIFACT_DIR/tmux-pipelines/$pipeline_id/state.json"
+      return
+    fi
     if [[ -f "$resolved/.omx/tmux-pipelines/$pipeline_id/state.json" ]]; then
       printf '%s\n' "$resolved/.omx/tmux-pipelines/$pipeline_id/state.json"
       return
     fi
     project_slug="$(project_slug_from_path "$resolved")"
-    if [[ -f "$PIPELINE_STATE_ROOT/$provider/$project_slug/$pipeline_id.json" ]]; then
-      printf '%s\n' "$PIPELINE_STATE_ROOT/$provider/$project_slug/$pipeline_id.json"
-      return
-    fi
+    for state_root in "$PIPELINE_STATE_ROOT" "$LEGACY_PIPELINE_STATE_ROOT"; do
+      if [[ -f "$state_root/$provider/$project_slug/$pipeline_id.json" ]]; then
+        printf '%s\n' "$state_root/$provider/$project_slug/$pipeline_id.json"
+        return
+      fi
+    done
   fi
   read_find_results_into_array matches "$PIPELINE_STATE_ROOT" -path "*/$pipeline_id.json" -type f
+  if [[ "$LEGACY_PIPELINE_STATE_ROOT" != "$PIPELINE_STATE_ROOT" ]]; then
+    read_find_results_into_array legacy_matches "$LEGACY_PIPELINE_STATE_ROOT" -path "*/$pipeline_id.json" -type f
+    matches+=("${legacy_matches[@]}")
+  fi
   if (( ${#matches[@]} == 1 )); then
     printf '%s\n' "${matches[0]}"
     return
@@ -1110,14 +1130,21 @@ find_state_by_id() {
 
 find_unique_active_state() {
   local provider="$1" cwd="$2" cwd_mode="$3"
-  local resolved project_slug matches=()
+  local resolved project_slug current_state matches=()
   if [[ -n "$cwd" ]]; then
     resolved="$(resolve_cwd "$cwd" "$cwd_mode")"
     project_slug="$(project_slug_from_path "$resolved")"
     read_find_results_into_array matches "$PIPELINE_STATE_ROOT/$provider/$project_slug" -maxdepth 1 -type f -name '*.json'
+    if (( ${#matches[@]} == 0 )); then
+      read_find_results_into_array matches "$LEGACY_PIPELINE_STATE_ROOT/$provider/$project_slug" -maxdepth 1 -type f -name '*.json'
+    fi
   elif [[ -f "$PIPELINE_STATE_ROOT/current.json" ]]; then
-    local current_state
     current_state="$(read_json_field "$PIPELINE_STATE_ROOT/current.json" global_state_file)"
+    if [[ -n "$current_state" && -f "$current_state" ]]; then
+      matches=("$current_state")
+    fi
+  elif [[ -f "$LEGACY_PIPELINE_STATE_ROOT/current.json" ]]; then
+    current_state="$(read_json_field "$LEGACY_PIPELINE_STATE_ROOT/current.json" global_state_file)"
     if [[ -n "$current_state" && -f "$current_state" ]]; then
       matches=("$current_state")
     fi

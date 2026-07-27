@@ -24,10 +24,18 @@ from typing import Any
 
 
 HOME = Path.home()
-STATE_PATH = HOME / ".omx" / "state" / "review-budget.json"
+STATE_HOME = Path(
+    os.environ.get("ASK_TMUX_STATE_HOME")
+    or os.environ.get("XDG_STATE_HOME")
+    or str(HOME / ".local" / "state")
+) / "ask-tmux"
+LEGACY_STATE_HOME = HOME / ".omx"
+STATE_PATH = STATE_HOME / "review-budget.json"
+LEGACY_STATE_PATH = LEGACY_STATE_HOME / "state" / "review-budget.json"
 LOCK_PATH = STATE_PATH.with_suffix(".lock")
-CONSULTANT_LOG = HOME / ".omx" / "consultants" / "log.jsonl"
-CONTINUATION_LOG = HOME / ".omx" / "consultants" / "continuations.jsonl"
+CONSULTANT_LOG = STATE_HOME / "consultants" / "log.jsonl"
+LEGACY_CONSULTANT_LOG = LEGACY_STATE_HOME / "consultants" / "log.jsonl"
+CONTINUATION_LOG = STATE_HOME / "consultants" / "continuations.jsonl"
 
 POLICY = {
     "version": 1,
@@ -241,17 +249,20 @@ def build_fingerprint(args: list[str], cwd: Path, explicit: str) -> str:
 
 
 def load_state() -> dict[str, Any]:
-    if not os.path.lexists(STATE_PATH):
+    read_path = STATE_PATH
+    if not os.path.lexists(read_path) and os.path.lexists(LEGACY_STATE_PATH):
+        read_path = LEGACY_STATE_PATH
+    if not os.path.lexists(read_path):
         return {"version": 1, "policy": POLICY, "events": []}
     try:
-        state = json.loads(STATE_PATH.read_text())
+        state = json.loads(read_path.read_text())
     except Exception as exc:
-        raise GateDataError(f"review budget state is unreadable or malformed: {STATE_PATH}: {exc}") from exc
+        raise GateDataError(f"review budget state is unreadable or malformed: {read_path}: {exc}") from exc
     if not isinstance(state, dict) or not isinstance(state.get("events"), list):
-        raise GateDataError(f"review budget state has an invalid schema: {STATE_PATH}")
+        raise GateDataError(f"review budget state has an invalid schema: {read_path}")
     for event in state["events"]:
         if not isinstance(event, dict) or parse_dt(str(event.get("ts", ""))) is None:
-            raise GateDataError(f"review budget state contains an invalid event: {STATE_PATH}")
+            raise GateDataError(f"review budget state contains an invalid event: {read_path}")
     return state
 
 
@@ -282,29 +293,33 @@ def write_state(state: dict[str, Any]) -> None:
 
 def read_consultant_sends() -> list[dict[str, Any]]:
     events: list[dict[str, Any]] = []
-    if not os.path.lexists(CONSULTANT_LOG):
-        return events
-    try:
-        lines = CONSULTANT_LOG.read_text().splitlines()
-    except Exception as exc:
-        raise GateDataError(f"consultant log is unreadable: {CONSULTANT_LOG}: {exc}") from exc
-    for line in lines:
-        try:
-            event = json.loads(line)
-        except Exception as exc:
-            raise GateDataError(f"consultant log contains malformed JSON: {CONSULTANT_LOG}") from exc
-        if not isinstance(event, dict):
-            raise GateDataError(f"consultant log contains an invalid event: {CONSULTANT_LOG}")
-        if event.get("provider") != "claude" or event.get("event") != "send":
+    paths = [CONSULTANT_LOG]
+    if LEGACY_CONSULTANT_LOG != CONSULTANT_LOG:
+        paths.append(LEGACY_CONSULTANT_LOG)
+    for log_path in paths:
+        if not os.path.lexists(log_path):
             continue
-        ts = parse_dt(str(event.get("ts", "")))
-        if not ts:
-            raise GateDataError(f"consultant log contains a Claude send with an invalid timestamp: {CONSULTANT_LOG}")
-        events.append({
-            "ts": ts,
-            "session": str(event.get("session", "")),
-            "detail": str(event.get("detail", "")),
-        })
+        try:
+            lines = log_path.read_text().splitlines()
+        except Exception as exc:
+            raise GateDataError(f"consultant log is unreadable: {log_path}: {exc}") from exc
+        for line in lines:
+            try:
+                event = json.loads(line)
+            except Exception as exc:
+                raise GateDataError(f"consultant log contains malformed JSON: {log_path}") from exc
+            if not isinstance(event, dict):
+                raise GateDataError(f"consultant log contains an invalid event: {log_path}")
+            if event.get("provider") != "claude" or event.get("event") != "send":
+                continue
+            ts = parse_dt(str(event.get("ts", "")))
+            if not ts:
+                raise GateDataError(f"consultant log contains a Claude send with an invalid timestamp: {log_path}")
+            events.append({
+                "ts": ts,
+                "session": str(event.get("session", "")),
+                "detail": str(event.get("detail", "")),
+            })
     return events
 
 

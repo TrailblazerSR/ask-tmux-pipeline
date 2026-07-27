@@ -152,13 +152,13 @@ printf '%s\n' \
   '#!/usr/bin/env bash' \
   'set -euo pipefail' \
   '[[ "${1:-}" == "send" ]] || exit 96' \
-  'printf "raw:%s|launcher=%s|audit=%s\n" "$*" "${ASK_TMUX_CLAUDE_LAUNCHER:-}" "${ASK_TMUX_LOG_PATH:-$HOME/.omx/consultants/log.jsonl}" >> "$PIPELINE_RAW_LOG"' \
+  'printf "raw:%s|launcher=%s|audit=%s\n" "$*" "${ASK_TMUX_CLAUDE_LAUNCHER:-}" "${ASK_TMUX_LOG_PATH:-$HOME/.local/state/ask-tmux/consultants/log.jsonl}" >> "$PIPELINE_RAW_LOG"' \
   'cwd=""; shift' \
   'while [[ $# -gt 0 ]]; do case "$1" in --cwd) cwd="$2"; shift 2 ;; --cwd=*) cwd="${1#*=}"; shift ;; *) shift ;; esac; done' \
   '[[ -n "$cwd" ]] || exit 96' \
-  'audit_log="${ASK_TMUX_LOG_PATH:-$HOME/.omx/consultants/log.jsonl}"' \
+  'audit_log="${ASK_TMUX_LOG_PATH:-$HOME/.local/state/ask-tmux/consultants/log.jsonl}"' \
   'mkdir -p "$(dirname "$audit_log")"' \
-  'printf '\''{"ts":"%s","event":"send","provider":"claude","session":"stub","status":"sent","detail":"%s/.omx/consultants/packets/stub.md"}\n'\'' "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" "$cwd" >> "$audit_log"' \
+  'printf '\''{"ts":"%s","event":"send","provider":"claude","session":"stub","status":"sent","detail":"%s/.ask-tmux/consultants/packets/stub.md"}\n'\'' "$(date -u +%Y-%m-%dT%H:%M:%S+00:00)" "$cwd" >> "$audit_log"' \
   'response_file="$(mktemp "$PIPELINE_GATE_RESPONSE_DIR/response.XXXXXX")"' \
   'state_file="$response_file.state.json"' \
   'printf "{}\n" > "$state_file"' \
@@ -236,7 +236,7 @@ start_out="$(ASK_TMUX_CLAUDE_LAUNCHER=cc-claude \
 
 if [[ "$start_rc" != "10" ]]; then
   printf '%s\n' "$start_out" >&2
-  find "$TMPDIR/.omx/tmux-pipelines" -type f -name 'consultant-initial-*.out' -exec sed -n '1,200p' {} \; >&2
+  find "$TMPDIR/.ask-tmux/tmux-pipelines" -type f -name 'consultant-initial-*.out' -exec sed -n '1,200p' {} \; >&2
 fi
 printf '%s\n' "$start_out" | rg -q '^PIPELINE_STATUS=waiting_for_user$'
 [[ "$start_rc" == "10" ]]
@@ -280,11 +280,11 @@ rg -q 'Smoke owner draft' "$review_context"
 [[ "$(grep -c -- '--effort high' "$raw_log")" == "3" ]]
 [[ "$(grep -c '|launcher=cc-claude|' "$raw_log")" == "3" ]]
 [[ ! -e "$raw_trap_log" ]]
-main_audit="$gate_home/.omx/consultants/log.jsonl"
-continuation_audit="$gate_home/.omx/consultants/continuations.jsonl"
+main_audit="$gate_home/.local/state/ask-tmux/consultants/log.jsonl"
+continuation_audit="$gate_home/.local/state/ask-tmux/consultants/continuations.jsonl"
 [[ "$(grep -c '"event":"send"' "$main_audit")" == "1" ]]
 [[ "$(grep -c '"event":"send"' "$continuation_audit")" == "2" ]]
-python3 - "$gate_home/.omx/state/review-budget.json" "$pipeline_id" <<'PY'
+python3 - "$gate_home/.local/state/ask-tmux/review-budget.json" "$pipeline_id" <<'PY'
 import json
 import sys
 
@@ -317,7 +317,7 @@ printf '%s\n' "$unrelated_out" | rg -q '^PIPELINE_STATUS=policy_deferred$'
 printf '%s\n' "$unrelated_out" | rg -q '^outcome_kind=policy_deferred$'
 printf '%s\n' "$unrelated_out" | rg -q '^policy_reason=project_cooldown$'
 [[ "$(grep -c '^raw:send ' "$raw_log")" == "3" ]]
-python3 - "$gate_home/.omx/state/review-budget.json" <<'PY'
+python3 - "$gate_home/.local/state/ask-tmux/review-budget.json" <<'PY'
 import json
 import sys
 

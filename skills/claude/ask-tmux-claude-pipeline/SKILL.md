@@ -79,6 +79,7 @@ Use the resulting `final_context` file to revise the final answer.
 
 ## Output Contract
 
+- `PIPELINE_STATUS=waiting_for_consultant`: the tmux consultant is active; use the printed `monitor=...` command rather than replacing the pipeline because an outer task runner has not streamed further output.
 - `PIPELINE_STATUS=ready_for_synthesis`: read `final_context` and synthesize the final current-CLI response.
 - `PIPELINE_STATUS=waiting_for_user`: ask the printed question and wait.
 - `PIPELINE_STATUS=blocked`: report the blocker and relevant artifact path.

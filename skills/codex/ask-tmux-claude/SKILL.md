@@ -180,29 +180,29 @@ Use `--cwd` on `capture`, `attach`, and `release` whenever a generic key such as
 The runner writes a packet under:
 
 ```text
-<cwd>/.omx/consultants/packets/
+<cwd>/.ask-tmux/consultants/packets/
 ```
 
 The consultant must write its response under:
 
 ```text
-<cwd>/.omx/consultants/responses/
+<cwd>/.ask-tmux/consultants/responses/
 ```
 
 State lives under:
 
 ```text
-~/.omx/state/consultants/claude/
+~/.local/state/ask-tmux/consultants/claude/
 ```
 
 Operations are logged under:
 
 ```text
-~/.omx/consultants/log.jsonl
+~/.local/state/ask-tmux/consultants/log.jsonl
 ```
 
 Do not treat tmux pane scrollback as the authoritative result. The response file is the data plane; tmux is only the control plane.
 
-Raw `.omx` files are the v1 integration surface. Do not assume OMX MCP/state APIs are used by this runner.
+Ask-tmux artifacts are the integration surface. They do not invoke plugin MCP/state APIs; older artifacts are read only for recovery.
 
 For `--no-wait`, use `status --key ... --cwd ...` to reconcile completed response/sentinel pairs before sending again.

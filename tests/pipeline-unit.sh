@@ -62,7 +62,7 @@ grep -Fqx 'outcome_kind=policy_deferred' <<<"$policy_output" \
 grep -Fqx 'policy_reason=project_cooldown' <<<"$policy_output" \
   || fail "policy denial should emit its policy reason"
 
-state_file="$PROJECT_DIR/.omx/tmux-pipelines/policy-deferred/state.json"
+state_file="$PROJECT_DIR/.ask-tmux/tmux-pipelines/policy-deferred/state.json"
 [[ -f "$state_file" ]] || fail "policy denial should retain pipeline state"
 
 python3 - "$state_file" <<'PY'
@@ -159,7 +159,7 @@ set -e
 grep -Fq 'consultant_transport_failed' <<<"$transport_output" \
   || fail "unmarked provider exit 76 should remain a transport failure"
 
-transport_state="$PROJECT_DIR/.omx/tmux-pipelines/provider-exit-76/state.json"
+transport_state="$PROJECT_DIR/.ask-tmux/tmux-pipelines/provider-exit-76/state.json"
 python3 - "$transport_state" <<'PY'
 import json
 import sys
@@ -226,7 +226,7 @@ grep -Fqx 'PIPELINE_STATUS=blocked' <<<"$tmux_output" \
 grep -Fqx 'outcome_kind=tmux_socket_denied' <<<"$tmux_output" \
   || fail "pipeline should propagate the typed tmux denial"
 
-tmux_state="$PROJECT_DIR/.omx/tmux-pipelines/tmux-socket-denied/state.json"
+tmux_state="$PROJECT_DIR/.ask-tmux/tmux-pipelines/tmux-socket-denied/state.json"
 [[ ! -e "$tmux_state" ]] \
   || fail "blocking preflight should run before pipeline state creation"
 [[ ! -e "$GATE_CALL_LOG" ]] \
@@ -261,7 +261,7 @@ set -e
 grep -Fqx 'outcome_kind=provider_not_ready' <<<"$provider_output" \
   || fail "pipeline should propagate provider readiness outcome"
 
-provider_state="$PROJECT_DIR/.omx/tmux-pipelines/provider-not-ready/state.json"
+provider_state="$PROJECT_DIR/.ask-tmux/tmux-pipelines/provider-not-ready/state.json"
 python3 - "$provider_state" <<'PY'
 import json
 import sys
@@ -306,7 +306,7 @@ grep -Fqx 'outcome_kind=tmux_prompt_delivery_unconfirmed' \
 grep -Fqx 'retryable=false' <<<"$delivery_unconfirmed_output" \
   || fail "unconfirmed delivery must not invite an automatic retry"
 
-delivery_unconfirmed_state="$PROJECT_DIR/.omx/tmux-pipelines/delivery-unconfirmed/state.json"
+delivery_unconfirmed_state="$PROJECT_DIR/.ask-tmux/tmux-pipelines/delivery-unconfirmed/state.json"
 python3 - "$delivery_unconfirmed_state" <<'PY'
 import json
 import sys
@@ -343,6 +343,14 @@ json_output="$(
 
 grep -Fqx 'PIPELINE_STATUS=ready_for_synthesis' <<<"$json_output" \
   || fail "v2 JSON result should complete the pipeline"
+grep -Fqx 'PIPELINE_STATUS=waiting_for_consultant' <<<"$json_output" \
+  || fail "pipeline should announce an active consultant wait before completion"
+grep -Fqx 'pipeline_id=json-result' <<<"$json_output" \
+  || fail "pipeline should expose its id while waiting for a consultant"
+grep -Fqx 'stage=initial' <<<"$json_output" \
+  || fail "pipeline should expose the active stage while waiting"
+grep -Fq 'monitor=ask-tmux-claude-pipeline status --pipeline-id json-result --cwd ' <<<"$json_output" \
+  || fail "pipeline should print a precise status polling command"
 json_artifact="$(sed -n 's/^tmux_response=//p' <<<"$json_output" | tail -1)"
 [[ -f "$json_artifact" ]] || fail "v2 JSON result should be retained as an artifact"
 grep -Fq '"schema":"ask_tmux_pipeline.result.v2"' "$json_artifact" \
@@ -446,7 +454,7 @@ grep -Fqx 'PIPELINE_STATUS=blocked' <<<"$stage_output" \
 grep -Fq 'parse_error=PIPELINE_STAGE mismatch: expected initial, got review' <<<"$stage_output" \
   || fail "stage mismatch should be explicit"
 
-stage_state="$PROJECT_DIR/.omx/tmux-pipelines/mismatched-stage/state.json"
+stage_state="$PROJECT_DIR/.ask-tmux/tmux-pipelines/mismatched-stage/state.json"
 python3 - "$stage_state" <<'PY'
 import json
 import sys
@@ -517,7 +525,7 @@ grep -Fqx 'PIPELINE_STATUS=waiting_for_user' <<<"$followup_policy_output" \
 grep -Fqx 'outcome_kind=policy_deferred' <<<"$followup_policy_output" \
   || fail "denied followup should expose its policy outcome"
 
-followup_state="$PROJECT_DIR/.omx/tmux-pipelines/policy-followup/state.json"
+followup_state="$PROJECT_DIR/.ask-tmux/tmux-pipelines/policy-followup/state.json"
 python3 - "$followup_state" <<'PY'
 import json
 import sys
@@ -600,7 +608,7 @@ grep -Fqx 'PIPELINE_STATUS=ready_for_synthesis' <<<"$review_policy_output" \
 grep -Fqx 'outcome_kind=policy_deferred' <<<"$review_policy_output" \
   || fail "denied review should expose its policy outcome"
 
-review_state="$PROJECT_DIR/.omx/tmux-pipelines/json-result/state.json"
+review_state="$PROJECT_DIR/.ask-tmux/tmux-pipelines/json-result/state.json"
 python3 - "$review_state" <<'PY'
 import json
 import sys

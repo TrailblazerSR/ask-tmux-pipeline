@@ -84,6 +84,39 @@ ready_with_stale_trust='
   gpt-5.5 xhigh fast · /tmp/project
 '
 
+codex_auto_review_loading='
+╭─────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.146.0-alpha.3.1)            │
+│                                                 │
+│ model:       loading   /model to change         │
+│ directory:   ~/Downloads/Datasets_Miscellaneous │
+│ permissions: YOLO mode                          │
+╰─────────────────────────────────────────────────╯
+
+› Run /review on my current changes
+
+  codex-auto-review default · ~/Downloads/Datasets_Miscellaneous
+'
+
+codex_auto_review_ready='
+╭───────────────────────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.146.0-alpha.3.1)                  │
+│                                                       │
+│ model:       codex-auto-review max   /model to change │
+│ directory:   ~/Downloads/Datasets_Miscellaneous       │
+│ permissions: YOLO mode                                │
+╰───────────────────────────────────────────────────────╯
+
+  Tip: Try the Desktop app. Run '"'"'codex app'"'"' or visit
+  https://chatgpt.com/codex?app-landing-page=true
+
+• Starting MCP servers (1/2): codex_apps (7s • esc to interrupt)
+
+› Run /review on my current changes
+
+  codex-auto-review max · ~/Downloads/Datasets_Miscellaneous
+'
+
 claude_ready_with_status='
 ╭─── Claude Code v2.1.195 ─────────────────────────────────────────────────────╮
 │                 Welcome back!                                                │
@@ -160,8 +193,23 @@ collapsed_unsent_text='
 
 codex_launch_cmd="$(provider_launch_command codex false)"
 
+[[ "$(shell_quote '/tmp/ask tmux response.md')" == "'/tmp/ask tmux response.md'" ]] \
+  || fail "response paths with spaces must be shell-quoted in prompts"
+stub_space_root="$(mktemp -d /tmp/ask-tmux-stub-space.XXXXXX)"
+stub_space_response="$stub_space_root/response folder/response.md"
+stub_space_b64="$(printf '%s' "$stub_space_response" | base64 | tr -d '\n')"
+stub_space_line="ASK_TMUX_RESPONSE=$(shell_quote "$stub_space_response") ASK_TMUX_RESPONSE_B64=$stub_space_b64 ASK_TMUX_SENTINEL=<<<ASK_TMUX_DONE:stub-space>>>"
+stub_space_output="$(printf '%s\n' "$stub_space_line" | eval "$(provider_launch_command codex true)")"
+[[ -f "$stub_space_response" ]] \
+  || fail "stub transport must decode a response path containing spaces"
+grep -Fq "$stub_space_response" <<<"$stub_space_output" \
+  || fail "stub transport must preserve the quoted response path"
+rm -rf "$stub_space_root"
+
 assert_not_ready codex "$trust_plus_banner_no_composer"
 assert_ready codex "$ready_with_stale_trust"
+assert_not_ready codex "$codex_auto_review_loading"
+assert_ready codex "$codex_auto_review_ready"
 assert_ready claude "$claude_ready_with_status"
 text_contains_sentinel "$wrapped_sentinel" "$sentinel" || fail "wrapped sentinel was not detected"
 
@@ -480,7 +528,7 @@ for event in events:
         continue
     matches.append(event)
 print(len(matches))
-' "$test_home/.omx/state/review-budget.json" "$kind" "$decision" "$exit_code"
+' "$test_home/.local/state/ask-tmux/review-budget.json" "$kind" "$decision" "$exit_code"
 }
 
 assert_ledger_event_count() {
@@ -541,8 +589,8 @@ fi
 printf '%s\n' "$unsupported_reason_out" | grep -q 'unsupported --gate-reason: invented_gate' || fail "unsupported reason denial should be explicit"
 
 corrupt_state_home="$gated_tmp/corrupt-state-home"
-mkdir -p "$corrupt_state_home/.omx/state"
-printf '{broken' > "$corrupt_state_home/.omx/state/review-budget.json"
+mkdir -p "$corrupt_state_home/.local/state/ask-tmux"
+printf '{broken' > "$corrupt_state_home/.local/state/ask-tmux/review-budget.json"
 if corrupt_state_out="$(env -i HOME="$corrupt_state_home" PATH="$gated_tmp/empty-bin" \
   "$python_bin" "$ROOT/bin/ask-tmux-claude-gated" check \
     --gate-reason external_review_required --cwd "$gated_tmp" 2>&1)"; then
@@ -552,11 +600,11 @@ else
 fi
 [[ "$corrupt_state_rc" == "78" ]] || fail "malformed review budget state should exit 78"
 printf '%s\n' "$corrupt_state_out" | grep -q 'review budget state is unreadable or malformed' || fail "malformed state denial should be explicit"
-[[ "$(cat "$corrupt_state_home/.omx/state/review-budget.json")" == '{broken' ]] || fail "malformed review budget state must not be overwritten"
+[[ "$(cat "$corrupt_state_home/.local/state/ask-tmux/review-budget.json")" == '{broken' ]] || fail "malformed review budget state must not be overwritten"
 
 corrupt_log_home="$gated_tmp/corrupt-log-home"
-mkdir -p "$corrupt_log_home/.omx/consultants"
-printf 'not-json\n' > "$corrupt_log_home/.omx/consultants/log.jsonl"
+mkdir -p "$corrupt_log_home/.local/state/ask-tmux/consultants"
+printf 'not-json\n' > "$corrupt_log_home/.local/state/ask-tmux/consultants/log.jsonl"
 if corrupt_log_out="$(env -i HOME="$corrupt_log_home" PATH="$gated_tmp/empty-bin" \
   "$python_bin" "$ROOT/bin/ask-tmux-claude-gated" check \
     --gate-reason external_review_required --cwd "$gated_tmp" 2>&1)"; then
@@ -566,7 +614,7 @@ else
 fi
 [[ "$corrupt_log_rc" == "78" ]] || fail "malformed consultant log should exit 78"
 printf '%s\n' "$corrupt_log_out" | grep -q 'consultant log contains malformed JSON' || fail "malformed consultant log denial should be explicit"
-[[ "$(cat "$corrupt_log_home/.omx/consultants/log.jsonl")" == 'not-json' ]] || fail "malformed consultant log must not be overwritten"
+[[ "$(cat "$corrupt_log_home/.local/state/ask-tmux/consultants/log.jsonl")" == 'not-json' ]] || fail "malformed consultant log must not be overwritten"
 
 printf '%s\n' \
   '#!/bin/sh' \
@@ -622,7 +670,7 @@ concurrent_two_pid=$!
 wait "$concurrent_one_pid" "$concurrent_two_pid"
 [[ "$(sort "$gated_tmp"/concurrent-*.rc | tr '\n' ' ')" == '0 76 ' ]] || fail "concurrent sends should reserve one slot and deny the other"
 [[ "$(wc -l < "$concurrent_log" | tr -d ' ')" == "1" ]] || fail "concurrent sends should invoke exactly one transport stub"
-grep -q '"kind": "send_dry_run"' "$concurrent_home/.omx/state/review-budget.json" || fail "completed reservation should remain in the ledger"
+grep -q '"kind": "send_dry_run"' "$concurrent_home/.local/state/ask-tmux/review-budget.json" || fail "completed reservation should remain in the ledger"
 
 pipeline_cwd="$gated_tmp/pipeline-cwd"
 pipeline_other_cwd="$gated_tmp/pipeline-other-cwd"
@@ -665,7 +713,7 @@ matches = [
     and event.get("content_digest") == sys.argv[4]
 ]
 assert len(matches) == 1, matches
-' "$grant_home/.omx/state/review-budget.json" pipeline:grant-regression grant-key "$pipeline_root_digest" || \
+' "$grant_home/.local/state/ask-tmux/review-budget.json" pipeline:grant-regression grant-key "$pipeline_root_digest" || \
   fail "pipeline start ledger entry should preserve its scoped grant fields"
 
 no_grant_message='pipeline continuation has no successful same-project start within the continuation TTL'
@@ -725,7 +773,7 @@ for event in state["events"]:
 with open(path, "w") as handle:
     json.dump(state, handle, indent=2, sort_keys=True)
     handle.write("\n")
-' "$grant_home/.omx/state/review-budget.json"
+' "$grant_home/.local/state/ask-tmux/review-budget.json"
 expect_gated_deny_without_transport \
   "$grant_home" "$grant_transport" "$grant_log" "$no_grant_message" send \
   --gate-reason external_review_required \
@@ -1001,7 +1049,7 @@ for event in state["events"]:
 with open(path, "w") as handle:
     json.dump(state, handle, indent=2, sort_keys=True)
     handle.write("\n")
-' "$root_isolation_home/.omx/state/review-budget.json" "$root_a_digest"
+' "$root_isolation_home/.local/state/ask-tmux/review-budget.json" "$root_a_digest"
 run_gated_with_stub \
   "$root_isolation_home" "$root_isolation_transport" "$root_isolation_log" send \
   --gate-reason external_review_required \
@@ -1085,7 +1133,7 @@ import sys
 events = json.load(open(sys.argv[1]))["events"]
 starts = [event for event in events if event.get("kind") == "send" and event.get("pipeline_start") is True]
 print(starts[-1].get("grant_id", ""))
-' "$same_root_home/.omx/state/review-budget.json")"
+' "$same_root_home/.local/state/ask-tmux/review-budget.json")"
 [[ -n "$old_grant_id" ]] || fail "old pipeline start should receive a grant ID"
 run_gated_with_stub "$same_root_home" "$same_root_transport" "$same_root_log" send \
   --gate-reason external_review_required \
@@ -1130,7 +1178,7 @@ for event in state["events"]:
 with open(path, "w") as handle:
     json.dump(state, handle, indent=2, sort_keys=True)
     handle.write("\n")
-' "$same_root_home/.omx/state/review-budget.json" "$old_grant_id"
+' "$same_root_home/.local/state/ask-tmux/review-budget.json" "$old_grant_id"
 run_gated_with_stub "$same_root_home" "$same_root_transport" "$same_root_log" send \
   --gate-reason external_review_required \
   --gate-fingerprint pipeline:same-root-new-grant \
@@ -1146,7 +1194,7 @@ import sys
 events = json.load(open(sys.argv[1]))["events"]
 starts = [event for event in events if event.get("kind") == "send" and event.get("pipeline_start") is True]
 print(starts[-1].get("grant_id", ""))
-' "$same_root_home/.omx/state/review-budget.json")"
+' "$same_root_home/.local/state/ask-tmux/review-budget.json")"
 [[ -n "$fresh_grant_id" ]] || fail "fresh same-root pipeline start should receive a grant ID"
 [[ "$fresh_grant_id" != "$old_grant_id" ]] || fail "fresh same-root pipeline start should receive a distinct grant ID"
 
@@ -1219,7 +1267,7 @@ assert len([event for event in old_allowed if event.get("exit_code") == 42]) == 
 assert len(fresh_allowed) == 3, fresh_allowed
 assert {event.get("continuation") for event in fresh_allowed} == {"answer:1", "answer:2", "review:1"}, fresh_allowed
 assert len(fresh_denied) == 1 and fresh_denied[0].get("continuation") == "answer:2", fresh_denied
-' "$same_root_home/.omx/state/review-budget.json" "$old_grant_id" "$fresh_grant_id" || \
+' "$same_root_home/.local/state/ask-tmux/review-budget.json" "$old_grant_id" "$fresh_grant_id" || \
   fail "same-root continuation evidence should remain isolated by grant ID"
 assert_no_pipeline_reservations "$same_root_home"
 

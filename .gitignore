@@ -1,4 +1,7 @@
 .DS_Store
 *.tmp
 *.log
+.ask-tmux/
+# Historical OMX artifacts are retained locally for recovery but never tracked.
 .omx/
+bin/__pycache__/

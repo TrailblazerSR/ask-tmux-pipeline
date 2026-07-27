@@ -209,9 +209,9 @@ grep -Fqx 'ASK_TMUX_OUTCOME=tmux_socket_denied' <<<"$send_output" \
   || fail "send should emit a machine-readable tmux denial"
 grep -Fq '"kind": "tmux_socket_denied"' <<<"$send_output" \
   || fail "send should retain the preflight evidence"
-[[ ! -e "$SEND_HOME/.omx/state/consultants" ]] \
+[[ ! -e "$SEND_HOME/.local/state/ask-tmux/consultants" ]] \
   || fail "send should not create consultant state after preflight denial"
-[[ ! -e "$SEND_PROJECT/.omx/consultants" ]] \
+[[ ! -e "$SEND_PROJECT/.ask-tmux/consultants" ]] \
   || fail "send should not create packets after preflight denial"
 
 if grep -Eq 'new-session|send-keys|kill-session|paste-buffer|set-buffer' "$FAKE_LOG"; then
@@ -423,7 +423,7 @@ run_control_send() {
 
 assert_failed_nonbusy_state() {
   local case_home="$1" state_file
-  state_file="$(find "$case_home/.omx/state/consultants" -type f -name '*.json' | sed -n '1p')"
+  state_file="$(find "$case_home/.local/state/ask-tmux/consultants" -type f -name '*.json' | sed -n '1p')"
   [[ -n "$state_file" ]] || fail "expected a persisted consultant failure state"
   python3 - "$state_file" <<'PY'
 import json
@@ -438,7 +438,7 @@ PY
 
 assert_live_state() {
   local case_home="$1" expected_busy="$2" state_file
-  state_file="$(find "$case_home/.omx/state/consultants" -type f -name '*.json' | sed -n '1p')"
+  state_file="$(find "$case_home/.local/state/ask-tmux/consultants" -type f -name '*.json' | sed -n '1p')"
   [[ -n "$state_file" ]] || fail "expected a persisted consultant live state"
   python3 - "$state_file" "$expected_busy" <<'PY'
 import json
@@ -512,7 +512,7 @@ set -e
 grep -Fqx 'ASK_TMUX_OUTCOME=tmux_runtime_socket_denied' <<<"$pane_resolution_denied_output" \
   || fail "pane discovery should retain its typed control denial"
 pane_resolution_denied_state="$(
-  find "$PANE_RESOLUTION_DENIED_HOME/.omx/state/consultants" -type f -name '*.json' | sed -n '1p'
+  find "$PANE_RESOLUTION_DENIED_HOME/.local/state/ask-tmux/consultants" -type f -name '*.json' | sed -n '1p'
 )"
 [[ -n "$pane_resolution_denied_state" ]] \
   || fail "successful new-session must be recorded before pane discovery"
@@ -574,7 +574,7 @@ grep -Fqx 'ASK_TMUX_OUTCOME=tmux_prompt_delivery_unconfirmed' <<<"$ambiguous_del
 grep -Fqx 'ASK_TMUX_RETRYABLE=false' <<<"$ambiguous_delivery_output" \
   || fail "accepted-unconfirmed delivery must not invite an automatic resend"
 ambiguous_delivery_state="$(
-  find "$AMBIGUOUS_DELIVERY_HOME/.omx/state/consultants" -type f -name '*.json' | sed -n '1p'
+  find "$AMBIGUOUS_DELIVERY_HOME/.local/state/ask-tmux/consultants" -type f -name '*.json' | sed -n '1p'
 )"
 python3 - "$ambiguous_delivery_state" <<'PY'
 import json
@@ -607,14 +607,14 @@ create_live_control_fixture() {
       --ready-timeout 0 \
       --prompt "Create a live state fixture." \
       >/dev/null
-  find "$case_home/.omx/state/consultants" -type f -name '*.json' | sed -n '1p'
+  find "$case_home/.local/state/ask-tmux/consultants" -type f -name '*.json' | sed -n '1p'
 }
 
 RECONCILE_DENIED_HOME="$TEST_ROOT/reconcile-denied-home"
 reconcile_denied_state="$(create_live_control_fixture "$RECONCILE_DENIED_HOME" reconcile-denied)"
 cp "$reconcile_denied_state" "$reconcile_denied_state.before"
 reconcile_packet_count_before="$(
-  find "$SEND_PROJECT/.omx/consultants/packets" -type f | wc -l | tr -d ' '
+  find "$SEND_PROJECT/.ask-tmux/consultants/packets" -type f | wc -l | tr -d ' '
 )"
 set +e
 reconcile_denied_output="$(
@@ -642,7 +642,7 @@ grep -Fqx 'ASK_TMUX_OUTCOME=tmux_runtime_socket_denied' <<<"$reconcile_denied_ou
 cmp -s "$reconcile_denied_state.before" "$reconcile_denied_state" \
   || fail "send reconciliation denial must not mutate lifecycle state"
 reconcile_packet_count_after="$(
-  find "$SEND_PROJECT/.omx/consultants/packets" -type f | wc -l | tr -d ' '
+  find "$SEND_PROJECT/.ask-tmux/consultants/packets" -type f | wc -l | tr -d ' '
 )"
 [[ "$reconcile_packet_count_after" == "$reconcile_packet_count_before" ]] \
   || fail "send reconciliation denial must stop before writing another packet"
@@ -773,7 +773,7 @@ with open(path, "w", encoding="utf-8") as handle:
 PY
 cp "$replace_denied_state" "$replace_denied_state.before"
 replace_packet_count_before="$(
-  find "$SEND_PROJECT/.omx/consultants/packets" -type f | wc -l | tr -d ' '
+  find "$SEND_PROJECT/.ask-tmux/consultants/packets" -type f | wc -l | tr -d ' '
 )"
 set +e
 replace_denied_output="$(
@@ -803,7 +803,7 @@ grep -Fqx 'ASK_TMUX_OUTCOME=tmux_runtime_socket_denied' <<<"$replace_denied_outp
 cmp -s "$replace_denied_state.before" "$replace_denied_state" \
   || fail "fresh replace kill denial must not mutate lifecycle state"
 replace_packet_count_after="$(
-  find "$SEND_PROJECT/.omx/consultants/packets" -type f | wc -l | tr -d ' '
+  find "$SEND_PROJECT/.ask-tmux/consultants/packets" -type f | wc -l | tr -d ' '
 )"
 [[ "$replace_packet_count_after" == "$replace_packet_count_before" ]] \
   || fail "fresh replace kill denial must stop before writing another packet"

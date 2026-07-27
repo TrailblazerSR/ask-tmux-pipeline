@@ -96,6 +96,13 @@ Override paths if needed:
 BIN_DIR=/usr/local/bin CODEX_SKILLS_DIR=/path/to/codex/skills CLAUDE_SKILLS_DIR=/path/to/claude/skills ./install.sh
 ```
 
+## Artifact Paths
+
+New consultant packets and responses live under `<cwd>/.ask-tmux/`, and local
+state and audit logs live under `~/.local/state/ask-tmux/`. Existing `.omx`
+artifacts remain readable for recovery only; the runner does not require or
+invoke OMX.
+
 ## Quick Guide
 
 Check caller-context tmux access without creating a session or calling a
@@ -158,6 +165,12 @@ ask-tmux-claude-pipeline start \
   --cwd /path/to/project \
   --prompt "PROMPT X"
 ```
+
+At launch the pipeline immediately prints `PIPELINE_STATUS=waiting_for_consultant`,
+its id and stage, plus a `monitor=... status ...` command. This means the tmux
+consultant is working even though the pipeline does not stream its reasoning.
+Poll that command rather than replacing a healthy pipeline just because an outer
+task runner has not printed new output yet.
 
 Pure/mirror mode:
 
@@ -386,7 +399,7 @@ tmux server; restricted app sandboxes may fail closed with
 - Prefer file-backed packets over pasted giant prompts.
 - Keep `--cwd` explicit.
 - Use `--pipeline-id` for `answer`, `review`, `status`, `resume`, and `final-context`.
-- Treat `~/.omx/state/tmux-pipelines/current.json` as advisory only.
+- Treat `~/.local/state/ask-tmux/tmux-pipelines/current.json` as advisory only.
 - Do not send secrets, credentials, cookies, or personal login material.
 
 ## Friend Links
