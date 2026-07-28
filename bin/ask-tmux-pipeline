@@ -51,7 +51,7 @@ if ! command -v rg >/dev/null 2>&1; then
   }
 fi
 
-VERSION="0.4.0"
+VERSION="0.4.1"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 CLAUDE_PIPELINE_GATE_REASON="external_review_required"
 DEFAULT_CLAUDE_EFFORT="${ASK_TMUX_CLAUDE_EFFORT:-high}"

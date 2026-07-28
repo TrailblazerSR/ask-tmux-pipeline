@@ -156,7 +156,8 @@ local wait timeout. Raising `--wait-timeout` cannot extend a gateway's
 `provider_gateway_timeout_524` and does not automatically lower effort,
 switch providers, or retry the unchanged workload. Split the task or shorten
 the requested output; use a lower one-off `--effort` only when explicitly
-chosen.
+chosen. Detection uses the structured origin-timeout markers rather than
+Claude's decorative activity glyph, which can vary across TUI versions.
 
 Send the same prompt to tmux Claude and synthesize the result in the owner CLI:
 

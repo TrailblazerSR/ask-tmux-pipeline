@@ -253,6 +253,10 @@ assert_not_ready codex "$hooks_with_placeholder_shape"
 assert_not_ready codex "$trust_with_placeholder_shape"
 assert_ready claude "$claude_ready_with_status"
 text_contains_sentinel "$wrapped_sentinel" "$sentinel" || fail "wrapped sentinel was not detected"
+[[ "$(claude_gateway_524_count 'Documentation mentions API Error: 524 without a provider error block.')" == "0" ]] \
+  || fail "a documentation-only 524 mention should not be classified as a provider failure"
+[[ "$(claude_gateway_524_count $'● API Error: 524 {"status":524,"error_code":524,\n"error_name":"origin_response_timeout","retryable":true}')" == "1" ]] \
+  || fail "the real Claude 2.1.220 gateway error rendering should be classified"
 
 original_tmux_session_liveness="$(declare -f tmux_session_liveness)"
 original_tmux_control_command="$(declare -f tmux_control_command)"
@@ -284,7 +288,7 @@ tmux_control_command() {
   [[ "$1" == "capture-pane" ]] || return 1
   TMUX_CONTROL_EXIT=0
   if [[ -e "$provider_timeout_fixture" ]]; then
-    TMUX_CONTROL_STDOUT=$'⎿ API Error: 524\nCloudflare origin did not return a complete response within the 120-second Proxy Read Timeout'
+    TMUX_CONTROL_STDOUT=$'● API Error: 524 {"status":524,"error_code":524,\n"error_name":"origin_response_timeout","retryable":true}\nCloudflare origin did not return a complete response within the 120-second Proxy Read Timeout'
   else
     : > "$provider_timeout_fixture"
     TMUX_CONTROL_STDOUT="Claude is working"

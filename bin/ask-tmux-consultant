@@ -51,7 +51,7 @@ if ! command -v rg >/dev/null 2>&1; then
   }
 fi
 
-VERSION="0.4.0"
+VERSION="0.4.1"
 ASK_TMUX_STATE_HOME="${ASK_TMUX_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/ask-tmux}"
 STATE_ROOT="${ASK_TMUX_STATE_ROOT:-$ASK_TMUX_STATE_HOME/consultants}"
 LEGACY_STATE_ROOT="$HOME/.omx/state/consultants"
@@ -1302,12 +1302,37 @@ wait_for_ready() {
   done
 }
 
+claude_gateway_524_count() {
+  local text="$1"
+  printf '%s\n' "$text" | awk '
+    function has_origin_timeout_marker(line) {
+      return index(line, "origin_response_timeout") \
+        || index(line, "Proxy Read Timeout") \
+        || (index(line, "cloudflare_error") && index(line, "true"))
+    }
+    {
+      if (index($0, "API Error: 524")) {
+        pending_lines = 12
+      }
+      if (pending_lines > 0) {
+        if (has_origin_timeout_marker($0)) {
+          count++
+          pending_lines = 0
+          next
+        }
+        pending_lines--
+      }
+    }
+    END { print count + 0 }
+  '
+}
+
 wait_for_done() {
   local session="$1" pane="$2" sentinel="$3" response_path="$4" timeout="$5" min_response_epoch="${6:-0}" provider="${7:-}"
   local start now text saw_sentinel="false" initial_gateway_524_count current_gateway_524_count liveness_rc
   start="$(date +%s)"
   tmux_control_command capture-pane -J -t "$pane" -p -S "-2000" || return 5
-  initial_gateway_524_count="$(printf '%s\n' "$TMUX_CONTROL_STDOUT" | awk 'index($0, "⎿") && index($0, "API Error: 524") { count++ } END { print count + 0 }')"
+  initial_gateway_524_count="$(claude_gateway_524_count "$TMUX_CONTROL_STDOUT")"
   while true; do
     if tmux_session_liveness "$session"; then
       :
@@ -1325,7 +1350,7 @@ wait_for_done() {
       fi
     fi
     if [[ "$provider" == "claude" ]]; then
-      current_gateway_524_count="$(printf '%s' "$text" | awk 'index($0, "⎿") && index($0, "API Error: 524") { count++ } END { print count + 0 }')"
+      current_gateway_524_count="$(claude_gateway_524_count "$text")"
       if (( current_gateway_524_count > initial_gateway_524_count )); then
         return 4
       fi
