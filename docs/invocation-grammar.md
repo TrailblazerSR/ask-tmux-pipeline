@@ -242,10 +242,15 @@ integrations should emit the JSON envelope.
 - `tmux_prompt_delivery_unconfirmed` with `retryable=false`: Enter reached the
   provider, but the post-submit control check failed. The provider may still be
   running; inspect the retained session and state before any deliberate retry.
-- `provider_gateway_timeout_524`: the provider gateway ended the request at its
-  origin-response limit. Do not silently retry, switch providers, reduce effort,
-  or increase the local wait timeout. Reduce or split the workload, then start a
-  deliberate fresh request.
+- `provider_gateway_timeout_524`: the provider gateway ended a turn at its
+  origin-response limit. The runner preserves the partial response and
+  automatically resumes the same session and full scope for a bounded number
+  of attempts. It never switches providers or reduces effort. If recovery is
+  exhausted, the outcome remains `retryable=true` and the partial artifact is
+  retained.
+- `provider_scope_incomplete`: the strict response audit exhausted its bounded
+  completion revisions. Read the preserved response and scope-audit artifact;
+  do not treat a model-written completion marker as proof of coverage.
 
 ## Automatic-Use Checklist
 
@@ -260,5 +265,8 @@ Before executing a generated command, verify all of the following:
   prefix.
 - DeepSeek has no `--model` or `--effort` flags.
 - Continuations reuse the original `--pipeline-id`.
-- A 524 response is reported as a provider timeout, not misdiagnosed as a tmux
-  readiness failure.
+- A 524 response is either recovered in the same scoped session or reported as
+  a retryable provider timeout, never misdiagnosed as a tmux readiness failure.
+
+For the full diagnosis, recovery, and “issue addressed” acceptance procedure,
+follow [Claude Opus 5 Reliability Runbook](claude-opus5-reliability-runbook.md).

@@ -95,8 +95,8 @@ grep -Fqx 'ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-5' <<<"$claude_output" \
   || fail 'cc-claude did not map the opus alias to claude-opus-5'
 grep -Fqx 'CLAUDE_CODE_SUBAGENT_MODEL=UNSET' <<<"$claude_output" \
   || fail 'cc-claude unexpectedly forced a subagent model'
-grep -Fqx 'CLAUDE_CODE_EFFORT_LEVEL=high' <<<"$claude_output" \
-  || fail 'cc-claude did not default to high effort'
+grep -Fqx 'CLAUDE_CODE_EFFORT_LEVEL=UNSET' <<<"$claude_output" \
+  || fail 'cc-claude should leave effort selection to the caller'
 grep -Fqx 'ANTHROPIC_AUTH_PRESENT=yes' <<<"$claude_output" \
   || fail 'cc-claude did not pass provider authentication'
 grep -Fqx 'CLAUDE_PROVIDER_SECRET_PRESENT=no' <<<"$claude_output" \
@@ -113,8 +113,8 @@ grep -Fqx 'ANTHROPIC_MODEL=claude-opus-4-8' <<<"$claude_override_output" \
 claude_effort_override_output="$(
   run_launcher env CC_CLAUDE_EFFORT_LEVEL=medium "$CC_CLAUDE_BIN" --routing-test
 )"
-grep -Fqx 'CLAUDE_CODE_EFFORT_LEVEL=medium' <<<"$claude_effort_override_output" \
-  || fail 'cc-claude did not honor a one-off effort override'
+grep -Fqx 'CLAUDE_CODE_EFFORT_LEVEL=UNSET' <<<"$claude_effort_override_output" \
+  || fail 'cc-claude should not translate environment effort; callers pass --effort explicitly'
 
 deepseek_output="$(run_launcher "$CC_DEEPSEEK_BIN" --routing-test)"
 grep -Fqx 'ANTHROPIC_BASE_URL=https://api.deepseek.com/anthropic' <<<"$deepseek_output" \

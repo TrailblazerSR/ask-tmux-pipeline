@@ -61,6 +61,12 @@ gateway_timeout_kind="$(
     'ERROR: Claude provider gateway returned API Error 524 before completion.'
 )"
 [[ "$gateway_timeout_kind" == "provider_gateway_timeout_524" ]]
+gateway_retryable="$(
+  bash -c 'source "$1"; consultant_failure_retryable "$2"' _ \
+    "$ROOT/bin/ask-tmux-pipeline" \
+    $'ASK_TMUX_OUTCOME=provider_gateway_timeout_524\nASK_TMUX_RETRYABLE=true'
+)"
+[[ "$gateway_retryable" == "true" ]]
 
 cleanup() {
   "$REAL_TMUX_BIN" -S "$SMOKE_TMUX_SOCKET" kill-server >/dev/null 2>&1 || true

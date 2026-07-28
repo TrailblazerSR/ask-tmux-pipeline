@@ -22,9 +22,10 @@ Claude defaults to `high`; DeepSeek retains its provider-owned `max` effort.
 
 `API Error: 524` means the configured provider gateway reached its 120-second
 origin-response limit. Increasing the ask-tmux `--wait-timeout` cannot extend
-that upstream deadline. The runner should fail the request promptly. Retry
-once only after splitting the task, requesting a concise response, or lowering
-`--effort`; do not silently change the model or provider.
+that upstream deadline. The runner preserves incremental response work and
+resumes the same session and complete scope for bounded attempts. It never
+silently changes the model, provider, or effort. Exhausted recovery retains the
+partial artifact and reports `retryable=true`.
 
 For an explicitly requested dual review, use `ask-tmux-claude-dual send` with
 `--gate-reason explicit_user_request`. It concurrently runs isolated,
@@ -62,13 +63,28 @@ current caller before a live send.
 
 Reuse a live same-key session by default. Use `--key` as the consultant identity. Same-key sessions are separated by project and by a collision-safe key hash. Use `--cwd` with `capture`, `attach`, and `release` whenever the key could exist in multiple projects; ambiguous lifecycle commands fail instead of guessing. Use `--fresh` only for a new independent consultation; release first or pass `--replace` if a same-key session exists. State is global under `~/.local/state/ask-tmux/consultants/`; logs are under `~/.local/state/ask-tmux/consultants/log.jsonl`; packets and responses are project-local under `.ask-tmux/consultants/`. The canonical command is `ask-tmux-claude`; `ask-tux-claude` is only a typo-compatible wrapper.
 
-By default `send` waits for a response file plus done sentinel and prints the response. Use `--no-wait` only when the owner session should continue immediately. After `--no-wait`, run `ask-tmux-claude status --key <key> --cwd <project>` to reconcile a completed sentinel/response pair before reusing the same key. A busy same-key session rejects new prompts unless the prior sentinel and response file prove completion.
+By default `send` waits for a durably completed response file and a strict
+scope audit before printing the response. A pane sentinel alone is
+insufficient. Use `--no-wait` only when the owner session should continue
+immediately. After `--no-wait`, run `ask-tmux-claude status --key <key> --cwd
+<project>` to reconcile state before reusing the same key.
 
 ## Safety
 
 Packets default to read-only review/comment/suggest instructions. Do not grant write scope unless the user explicitly asks for persistent edits.
 
-The only default write allowed is the required response file named in the packet. This is an instruction boundary, not an OS sandbox: the runner launches Claude with elevated local permissions, so only send trusted materials. Ask-tmux artifacts are the integration surface; older artifacts are read only for recovery.
+Claude consultants launch in `--bare` mode so owner plugins, hooks, MCP
+servers, memories, and auto-discovered instructions do not contaminate the
+review. The only default writes are the required response and scope-audit
+files. This is an instruction boundary, not an OS sandbox: the runner uses
+elevated local permissions, so only send trusted materials.
+
+Never claim a transport defect is fixed from detection-only, stub-only, or
+grep-only evidence. Require a deterministic regression, the complete local
+test cohort, a live non-private Opus 5/high probe, a synthetic full-scope
+acceptance run, installed/source parity, and installed doctor/preflight checks.
+The repository procedure is
+`docs/claude-opus5-reliability-runbook.md`.
 
 ## Test Without Cost
 

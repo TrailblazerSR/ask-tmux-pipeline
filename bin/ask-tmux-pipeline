@@ -51,7 +51,7 @@ if ! command -v rg >/dev/null 2>&1; then
   }
 fi
 
-VERSION="0.4.1"
+VERSION="0.4.2"
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 CLAUDE_PIPELINE_GATE_REASON="external_review_required"
 DEFAULT_CLAUDE_EFFORT="${ASK_TMUX_CLAUDE_EFFORT:-high}"
@@ -741,7 +741,7 @@ consultant_failure_kind() {
     return
   fi
   case "$marker" in
-    tmux_client_missing|tmux_socket_denied|tmux_protocol_mismatch|tmux_control_failed|tmux_session_missing|tmux_session_create_failed|tmux_prompt_delivery_failed|tmux_prompt_delivery_unconfirmed|tmux_runtime_socket_denied|tmux_runtime_protocol_mismatch|tmux_runtime_control_failed|tmux_runtime_client_missing|tmux_pane_missing|provider_not_ready|provider_interaction_required|provider_process_exited|provider_readiness_failed|provider_no_progress_timeout|provider_completion_timeout|provider_response_missing|provider_gateway_timeout_524)
+    tmux_client_missing|tmux_socket_denied|tmux_protocol_mismatch|tmux_control_failed|tmux_session_missing|tmux_session_create_failed|tmux_prompt_delivery_failed|tmux_prompt_delivery_unconfirmed|tmux_runtime_socket_denied|tmux_runtime_protocol_mismatch|tmux_runtime_control_failed|tmux_runtime_client_missing|tmux_pane_missing|provider_not_ready|provider_interaction_required|provider_process_exited|provider_readiness_failed|provider_no_progress_timeout|provider_completion_timeout|provider_response_missing|provider_gateway_timeout_524|provider_scope_incomplete)
       printf '%s\n' "$marker"
       return
       ;;

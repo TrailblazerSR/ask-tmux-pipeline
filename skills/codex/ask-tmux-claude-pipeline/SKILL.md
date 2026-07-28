@@ -120,9 +120,12 @@ Important markers:
   do not automatically resend.
 
 The pipeline classifies Claude `API Error: 524` as
-`provider_gateway_timeout_524`. Do not automatically lower effort, switch
-providers, or retry the unchanged workload. Keep the default `high` unless the
-user explicitly chooses a smaller task or a lower one-off effort.
+`provider_gateway_timeout_524`. The runner preserves partial work and resumes
+the same session and full scope for bounded attempts. It never lowers effort
+or switches providers automatically. Exhausted recovery remains
+`retryable=true`. `provider_scope_incomplete` means the strict response audit
+exhausted its bounded completion revisions; inspect both the response and
+scope-audit artifact.
 
 Use `status`, `resume`, and `final-context` with `--pipeline-id` when recovering a pipeline. Treat `~/.local/state/ask-tmux/tmux-pipelines/current.json` as advisory only; if more than one pipeline may exist, use explicit `--pipeline-id` and `--cwd`.
 

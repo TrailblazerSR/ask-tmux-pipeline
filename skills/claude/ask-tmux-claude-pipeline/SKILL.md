@@ -25,8 +25,9 @@ a Claude-only `--effort` override. Both options are rejected with
 persists the initial launcher, model, and effort for every continuation.
 
 Claude `API Error: 524` is recorded as `provider_gateway_timeout_524`.
-Do not automatically lower effort, switch providers, or retry the unchanged
-workload.
+The runner preserves partial work and resumes the same session and complete
+scope for bounded attempts. It never lowers effort or switches providers
+automatically. Exhausted recovery remains `retryable=true`.
 `ask-tmux-claude-dual` is an
 explicit one-off review wrapper, not a substitute for this single-consultant
 pipeline or its continuation grant.
@@ -93,6 +94,8 @@ Use the resulting `final_context` file to revise the final answer.
 - `tmux_prompt_delivery_unconfirmed` with `retryable=false`: Enter reached the
   provider but confirmation was lost. Inspect the retained session and state;
   do not automatically resend.
+- `provider_scope_incomplete`: the strict response audit exhausted its bounded
+  completion revisions; inspect the retained response and audit artifact.
 
 Use explicit `--pipeline-id` and `--cwd` when more than one pipeline may exist.
 

@@ -51,7 +51,7 @@ if ! command -v rg >/dev/null 2>&1; then
   }
 fi
 
-VERSION="0.4.1"
+VERSION="0.4.2"
 ASK_TMUX_STATE_HOME="${ASK_TMUX_STATE_HOME:-${XDG_STATE_HOME:-$HOME/.local/state}/ask-tmux}"
 STATE_ROOT="${ASK_TMUX_STATE_ROOT:-$ASK_TMUX_STATE_HOME/consultants}"
 LEGACY_STATE_ROOT="$HOME/.omx/state/consultants"
@@ -62,6 +62,11 @@ PACKET_LIMIT_BYTES="${ASK_TMUX_PACKET_LIMIT_BYTES:-65536}"
 READY_TIMEOUT_SECONDS="${ASK_TMUX_READY_TIMEOUT_SECONDS:-45}"
 WAIT_TIMEOUT_SECONDS="${ASK_TMUX_WAIT_TIMEOUT_SECONDS:-600}"
 DEFAULT_CLAUDE_EFFORT="${ASK_TMUX_CLAUDE_EFFORT:-high}"
+CLAUDE_524_MAX_RETRIES="${ASK_TMUX_CLAUDE_524_MAX_RETRIES:-2}"
+CLAUDE_524_BACKOFF_SECONDS="${ASK_TMUX_CLAUDE_524_BACKOFF_SECONDS:-120}"
+RESPONSE_CHUNK_WORDS="${ASK_TMUX_RESPONSE_CHUNK_WORDS:-900}"
+SCOPE_MAX_REVISIONS="${ASK_TMUX_SCOPE_MAX_REVISIONS:-3}"
+CLAUDE_RUNTIME_FLAGS="--bare --disable-slash-commands --no-chrome --dangerously-skip-permissions"
 
 usage() {
   cat <<'USAGE'
@@ -811,6 +816,25 @@ response_file_is_fresh() {
   (( mtime >= min_response_epoch ))
 }
 
+response_file_is_complete() {
+  local response_path="$1" completion_marker="$2" min_response_epoch="${3:-0}"
+  [[ -n "$completion_marker" ]] || return 1
+  response_file_is_fresh "$response_path" "$min_response_epoch" || return 1
+  tail -n 5 "$response_path" 2>/dev/null |
+    awk -v marker="$completion_marker" '$0 == marker { found = 1 } END { exit !found }'
+}
+
+strip_response_completion_marker() {
+  local response_path="$1" completion_marker="$2" temporary
+  [[ -f "$response_path" && -n "$completion_marker" ]] || return 1
+  temporary="$(mktemp "$(dirname "$response_path")/.response-complete.XXXXXX")"
+  if ! awk -v marker="$completion_marker" '$0 != marker { print }' "$response_path" > "$temporary"; then
+    rm -f "$temporary"
+    return 1
+  fi
+  mv -f "$temporary" "$response_path"
+}
+
 log_event() {
   local event="$1" provider="$2" session="$3" status="$4" detail="${5:-}"
   mkdir -p "$(dirname "$LOG_PATH")"
@@ -978,7 +1002,7 @@ provider_launch_command() {
     die "--effort is supported only for the Claude provider"
   fi
   if [[ "$stub" == "true" ]]; then
-    printf "%s" "bash -lc 'printf \"ASK_TMUX_STUB_READY\\n\"; while IFS= read -r line; do printf \"ASK_TMUX_STUB_RECEIVED:%s\\n\" \"\$line\"; response_b64=\$(printf \"%s\" \"\$line\" | sed -n \"s/.*ASK_TMUX_RESPONSE_B64=\\([^ ]*\\).*/\\1/p\"); response=\"\"; if [ -n \"\$response_b64\" ]; then response=\$(printf \"%s\" \"\$response_b64\" | base64 -D 2>/dev/null || printf \"%s\" \"\$response_b64\" | base64 -d 2>/dev/null); fi; sentinel=\$(printf \"%s\" \"\$line\" | sed -n \"s/.*ASK_TMUX_SENTINEL=\\([^ ]*\\).*/\\1/p\"); if [ -n \"\$response\" ]; then mkdir -p \"\$(dirname \"\$response\")\"; printf \"Stub consultant response for: %s\\n\" \"\$line\" > \"\$response\"; fi; if [ -n \"\$sentinel\" ]; then printf \"%s\\n\" \"\$sentinel\"; fi; done'"
+    printf "%s" "bash -lc 'printf \"ASK_TMUX_STUB_READY\\n\"; while IFS= read -r line; do printf \"ASK_TMUX_STUB_RECEIVED:%s\\n\" \"\$line\"; response_b64=\$(printf \"%s\" \"\$line\" | sed -n \"s/.*ASK_TMUX_RESPONSE_B64=\\([^ ]*\\).*/\\1/p\"); response=\"\"; if [ -n \"\$response_b64\" ]; then response=\$(printf \"%s\" \"\$response_b64\" | base64 -D 2>/dev/null || printf \"%s\" \"\$response_b64\" | base64 -d 2>/dev/null); fi; sentinel=\$(printf \"%s\" \"\$line\" | sed -n \"s/.*ASK_TMUX_SENTINEL=\\([^ ]*\\).*/\\1/p\"); completion=\$(printf \"%s\" \"\$line\" | sed -n \"s/.*ASK_TMUX_COMPLETION_MARKER=\\([^ ]*\\).*/\\1/p\"); if [ -n \"\$response\" ]; then mkdir -p \"\$(dirname \"\$response\")\"; printf \"Stub consultant response for: %s\\n\" \"\$line\" > \"\$response\"; if [ -n \"\$completion\" ]; then printf \"%s\\n\" \"\$completion\" >> \"\$response\"; fi; fi; if [ -n \"\$sentinel\" ]; then printf \"%s\\n\" \"\$sentinel\"; fi; done'"
     return
   fi
   launch_env="env PATH=$(shell_quote "$PATH") HOME=$(shell_quote "$HOME")"
@@ -994,7 +1018,11 @@ provider_launch_command() {
       printf '%s' "$launch_env bash -lc 'exec \"\$@\"' bash $(shell_quote "$claude_launcher")"
       [[ -n "$requested_model" ]] && printf ' --model %s' "$(shell_quote "$requested_model")"
       [[ -n "$requested_effort" ]] && printf ' --effort %s' "$(shell_quote "$requested_effort")"
-      printf ' --dangerously-skip-permissions\n'
+      # Keep consultants independent from the owner's plugins, hooks, MCP
+      # servers, memories, and auto-discovered instruction stack. Those
+      # customizations can also add tens of thousands of tokens before the
+      # explicit review packet is read.
+      printf ' %s\n' "$CLAUDE_RUNTIME_FLAGS"
       ;;
     codex) printf '%s\n' "$launch_env codex --dangerously-bypass-approvals-and-sandbox" ;;
     *) die "unknown provider: $provider" ;;
@@ -1015,8 +1043,8 @@ write_limited_file_block() {
 }
 
 write_packet() {
-  local packet="$1" provider="$2" task="$3" cwd="$4" owner_prompt="$5" response_path="$6" done_sentinel="$7"
-  shift 7
+  local packet="$1" provider="$2" task="$3" cwd="$4" owner_prompt="$5" response_path="$6" done_sentinel="$7" completion_marker="$8"
+  shift 8
   local material size
   mkdir -p "$(dirname "$packet")"
   {
@@ -1038,6 +1066,9 @@ write_packet() {
     printf '## Response File Contract\n\n'
     printf 'Write your full response to this absolute path:\n\n'
     printf '```text\n%s\n```\n\n' "$response_path"
+    printf 'Do not wait until the entire response has been composed in memory. Start the response file early and update it in bounded passes, targeting no more than %s words per write/append operation. Preserve completed sections if a provider request is interrupted. Cover the complete owner prompt; bounded writes do not authorize narrowing or omitting scope.\n\n' "$RESPONSE_CHUNK_WORDS"
+    printf 'When and only when the response is complete, append this exact marker on its own final line inside the response file:\n\n'
+    printf '```text\n%s\n```\n\n' "$completion_marker"
     printf 'After writing the response file, print exactly this sentinel on its own final line in the pane:\n\n'
     printf '```text\n%s\n```\n\n' "$done_sentinel"
     printf '## Materials\n\n'
@@ -1328,7 +1359,7 @@ claude_gateway_524_count() {
 }
 
 wait_for_done() {
-  local session="$1" pane="$2" sentinel="$3" response_path="$4" timeout="$5" min_response_epoch="${6:-0}" provider="${7:-}"
+  local session="$1" pane="$2" sentinel="$3" response_path="$4" timeout="$5" min_response_epoch="${6:-0}" provider="${7:-}" completion_marker="${8:-}"
   local start now text saw_sentinel="false" initial_gateway_524_count current_gateway_524_count liveness_rc
   start="$(date +%s)"
   tmux_control_command capture-pane -J -t "$pane" -p -S "-2000" || return 5
@@ -1343,9 +1374,15 @@ wait_for_done() {
     fi
     tmux_control_command capture-pane -J -t "$pane" -p -S "-2000" || return 5
     text="$TMUX_CONTROL_STDOUT"
+    # A complete durable response is stronger completion evidence than the
+    # cosmetic pane sentinel. Claude can finish the file and lose only its
+    # final terminal turn to a gateway timeout.
+    if response_file_is_complete "$response_path" "$completion_marker" "$min_response_epoch"; then
+      return 0
+    fi
     if text_contains_sentinel "$text" "$sentinel"; then
       saw_sentinel="true"
-      if response_file_is_fresh "$response_path" "$min_response_epoch"; then
+      if [[ -z "$completion_marker" ]] && response_file_is_fresh "$response_path" "$min_response_epoch"; then
         return 0
       fi
     fi
@@ -1361,6 +1398,129 @@ wait_for_done() {
       return 2
     fi
     sleep 1
+  done
+}
+
+WAIT_RECOVERY_RETRY_COUNT=0
+
+wait_for_done_resilient() {
+  local session="$1" pane="$2" sentinel="$3" response_path="$4" timeout="$5" min_response_epoch="$6" provider="$7" completion_marker="$8"
+  local stub="$9" ready_timeout="${10}" auto_trust="${11}" response_token="${12}"
+  local done_rc=0 retry_count=0 retry_prompt retry_delivery_status
+
+  while true; do
+    if wait_for_done "$session" "$pane" "$sentinel" "$response_path" "$timeout" "$min_response_epoch" "$provider" "$completion_marker"; then
+      done_rc=0
+    else
+      done_rc="$?"
+    fi
+    [[ "$done_rc" == "0" ]] && break
+    if [[ "$done_rc" != "4" || "$provider" != "claude" || "$retry_count" -ge "$CLAUDE_524_MAX_RETRIES" ]]; then
+      break
+    fi
+
+    retry_count="$((retry_count + 1))"
+    log_event "provider_gateway_timeout_524_retry" "$provider" "$session" "retrying" \
+      "attempt=$retry_count max=$CLAUDE_524_MAX_RETRIES backoff=${CLAUDE_524_BACKOFF_SECONDS}s response=$response_path"
+    info "provider_gateway_timeout_524 retry=$retry_count/$CLAUDE_524_MAX_RETRIES backoff_seconds=$CLAUDE_524_BACKOFF_SECONDS" >&2
+    if (( CLAUDE_524_BACKOFF_SECONDS > 0 )); then
+      sleep "$CLAUDE_524_BACKOFF_SECONDS"
+    fi
+    if ! wait_for_ready "$provider" "$stub" "$session" "$pane" "$ready_timeout" "$auto_trust"; then
+      done_rc=4
+      break
+    fi
+
+    retry_prompt="The preceding provider turn ended with gateway error 524. Resume this same task from the preserved session and any partial ASK_TMUX_RESPONSE file. Do not redo completed inspection or omit any requested scope. Continue the response in bounded passes, targeting no more than $RESPONSE_CHUNK_WORDS words per write/append operation. When the complete owner prompt has been covered, append $completion_marker on its own final line inside $response_token, then print $sentinel on its own final pane line."
+    retry_delivery_status=0
+    if send_prompt_to_pane "$pane" "$retry_prompt" "$provider" "$completion_marker"; then
+      retry_delivery_status=0
+    else
+      retry_delivery_status="$?"
+    fi
+    if [[ "$retry_delivery_status" != "0" ]]; then
+      done_rc=5
+      break
+    fi
+  done
+
+  WAIT_RECOVERY_RETRY_COUNT="$retry_count"
+  return "$done_rc"
+}
+
+scope_check_status() {
+  local scope_file="$1"
+  sed -n 's/^STATUS:[[:space:]]*//p' "$scope_file" 2>/dev/null |
+    sed -n '1p' |
+    tr '[:lower:]' '[:upper:]'
+}
+
+SCOPE_CHECK_LAST_FILE=""
+
+ensure_response_scope_complete() {
+  local session="$1" pane="$2" provider="$3" response_path="$4" response_token="$5" response_marker="$6" packet="$7"
+  local wait_timeout="$8" min_response_epoch="$9" stub="${10}" ready_timeout="${11}" auto_trust="${12}"
+  local response_root response_base pass=0 revision_count=0 scope_file scope_marker scope_sentinel
+  local scope_prompt scope_status revision_prompt delivery_rc wait_rc
+
+  [[ "$provider" == "claude" ]] || return 0
+  response_root="$(dirname "$response_path")"
+  response_base="$(basename "$response_path" .md)"
+
+  while true; do
+    pass="$((pass + 1))"
+    scope_file="$response_root/${response_base}.scope-$(printf '%02d' "$pass").md"
+    scope_marker="<<<ASK_TMUX_SCOPE_COMPLETE:${pass}:$(date +%s):$$>>>"
+    scope_sentinel="<<<ASK_TMUX_SCOPE_DONE:${pass}:$(date +%s):$$>>>"
+    rm -f "$scope_file"
+    SCOPE_CHECK_LAST_FILE="$scope_file"
+
+    if ! wait_for_ready "$provider" "$stub" "$session" "$pane" "$ready_timeout" "$auto_trust"; then
+      return 5
+    fi
+    scope_prompt="Perform a strict completeness audit of the consultant response. Read the original packet at $(shell_quote "$packet") and the response at $response_token. Enumerate every explicit deliverable, requested numbered item, section, constraint, and required decision in the owner prompt. Check that each is substantively answered in the actual file. Do not accept promises, forward references to nonexistent sections, headings without content, or a completion marker as evidence. Write only the audit to $(shell_quote "$scope_file") using exactly this protocol: first line ASK_TMUX_SCOPE_CHECK_V1; second line STATUS: COMPLETE or STATUS: INCOMPLETE; then REQUIRED, EVIDENCE, and MISSING sections with concrete mappings; final line $scope_marker. Print $scope_sentinel on its own final pane line. Mark COMPLETE only when nothing requested is missing."
+    delivery_rc=0
+    if send_prompt_to_pane "$pane" "$scope_prompt" "$provider" "$scope_marker"; then
+      delivery_rc=0
+    else
+      delivery_rc="$?"
+    fi
+    [[ "$delivery_rc" == "0" ]] || return 5
+
+    if wait_for_done_resilient "$session" "$pane" "$scope_sentinel" "$scope_file" "$wait_timeout" "$(date +%s)" "$provider" "$scope_marker" "$stub" "$ready_timeout" "$auto_trust" "$(shell_quote "$scope_file")"; then
+      wait_rc=0
+    else
+      wait_rc="$?"
+    fi
+    [[ "$wait_rc" == "0" ]] || return "$wait_rc"
+    strip_response_completion_marker "$scope_file" "$scope_marker" || true
+    scope_status="$(scope_check_status "$scope_file")"
+    if [[ "$scope_status" == "COMPLETE" ]]; then
+      return 0
+    fi
+
+    if [[ "$revision_count" -ge "$SCOPE_MAX_REVISIONS" ]]; then
+      return 6
+    fi
+    revision_count="$((revision_count + 1))"
+    strip_response_completion_marker "$response_path" "$response_marker" || true
+    if ! wait_for_ready "$provider" "$stub" "$session" "$pane" "$ready_timeout" "$auto_trust"; then
+      return 5
+    fi
+    revision_prompt="The strict scope audit at $(shell_quote "$scope_file") found the response incomplete or malformed. Read that audit, the original packet at $(shell_quote "$packet"), and the existing response at $response_token. Preserve correct existing content, replace false forward references, and append or revise every missing substantive item. Do not narrow the owner prompt. Continue using bounded write/append operations, targeting no more than $RESPONSE_CHUNK_WORDS words each. When the entire owner prompt is genuinely covered, append $response_marker on its own final line inside $response_token and print the original completion sentinel only after the file is complete."
+    delivery_rc=0
+    if send_prompt_to_pane "$pane" "$revision_prompt" "$provider" "$response_marker"; then
+      delivery_rc=0
+    else
+      delivery_rc="$?"
+    fi
+    [[ "$delivery_rc" == "0" ]] || return 5
+    if wait_for_done_resilient "$session" "$pane" "<<<ASK_TMUX_REVISION_DONE:${revision_count}>>>" "$response_path" "$wait_timeout" "$min_response_epoch" "$provider" "$response_marker" "$stub" "$ready_timeout" "$auto_trust" "$response_token"; then
+      wait_rc=0
+    else
+      wait_rc="$?"
+    fi
+    [[ "$wait_rc" == "0" ]] || return "$wait_rc"
   done
 }
 
@@ -1420,9 +1580,13 @@ cmd_send() {
 
   [[ "$ready_timeout" =~ ^[0-9]+$ ]] || die "--ready-timeout must be seconds"
   [[ "$wait_timeout" =~ ^[0-9]+$ ]] || die "--wait-timeout must be seconds"
+  [[ "$CLAUDE_524_MAX_RETRIES" =~ ^[0-9]+$ ]] || die "ASK_TMUX_CLAUDE_524_MAX_RETRIES must be a non-negative integer"
+  [[ "$CLAUDE_524_BACKOFF_SECONDS" =~ ^[0-9]+$ ]] || die "ASK_TMUX_CLAUDE_524_BACKOFF_SECONDS must be seconds"
+  [[ "$RESPONSE_CHUNK_WORDS" =~ ^[1-9][0-9]*$ ]] || die "ASK_TMUX_RESPONSE_CHUNK_WORDS must be a positive integer"
+  [[ "$SCOPE_MAX_REVISIONS" =~ ^[0-9]+$ ]] || die "ASK_TMUX_SCOPE_MAX_REVISIONS must be a non-negative integer"
 
-  local resolved project_slug key_id session pane state_file lock_file project_artifact_root packet_root packet response_root response done_sentinel launch_cmd short_prompt run_stamp
-  resolved="$(resolve_cwd "$cwd" "$cwd_mode" "${materials[@]-}")"
+  local resolved project_slug key_id session pane state_file lock_file project_artifact_root packet_root packet response_root response done_sentinel completion_marker launch_cmd short_prompt run_stamp
+  resolved="$(resolve_cwd "$cwd" "$cwd_mode" "${materials[@]+"${materials[@]}"}")"
   project_slug="$(project_slug_from_path "$resolved")"
   key="${key:-$task}"
   key_id="$(key_id_from_key "$key")"
@@ -1437,6 +1601,7 @@ cmd_send() {
   response_root="$project_artifact_root/consultants/responses"
   response="$response_root/${run_stamp}-${provider}-${key_id}.md"
   done_sentinel="<<<ASK_TMUX_DONE:${provider}:${key_id}:$(date +%s):$$>>>"
+  completion_marker="<<<ASK_TMUX_RESPONSE_COMPLETE:${provider}:${key_id}:$(date +%s):$$>>>"
   if [[ "$dry_run" == "true" ]]; then
     launch_cmd="$(provider_launch_command "$provider" "$stub" "$requested_model" "$requested_effort")"
     info "DRY_RUN provider=$provider"
@@ -1449,6 +1614,7 @@ cmd_send() {
 	    info "DRY_RUN packet=$packet"
 	    info "DRY_RUN response=$response"
 	    info "DRY_RUN done_sentinel=$done_sentinel"
+	    info "DRY_RUN completion_marker=$completion_marker"
 	    info "DRY_RUN launch_command=$launch_cmd"
 	    info "DRY_RUN claude_launcher=$claude_launcher"
 	    info "DRY_RUN requested_model=$requested_model"
@@ -1579,7 +1745,7 @@ cmd_send() {
     fi
   fi
 
-  write_packet "$packet" "$provider" "$task" "$resolved" "$owner_prompt" "$response" "$done_sentinel" "${materials[@]-}"
+  write_packet "$packet" "$provider" "$task" "$resolved" "$owner_prompt" "$response" "$done_sentinel" "$completion_marker" "${materials[@]+"${materials[@]}"}"
 
   if [[ "$session_liveness_status" == "1" ]]; then
     if ! tmux_control_command new-session -d -s "$session" -c "$resolved" "$launch_cmd" 9>&-; then
@@ -1662,7 +1828,7 @@ cmd_send() {
   response_token="$(shell_quote "$response")"
   response_b64="$(printf '%s' "$response" | base64 | tr -d '\n')"
   packet_token="$(shell_quote "$packet")"
-  short_prompt="ASK_TMUX_RESPONSE=$response_token ASK_TMUX_RESPONSE_B64=$response_b64 ASK_TMUX_SENTINEL=$done_sentinel Read and follow this review packet: $packet_token . Task: $owner_prompt . When complete, write your full response to the ASK_TMUX_RESPONSE path and print only the ASK_TMUX_SENTINEL value on its own final line."
+  short_prompt="ASK_TMUX_RESPONSE=$response_token ASK_TMUX_RESPONSE_B64=$response_b64 ASK_TMUX_SENTINEL=$done_sentinel ASK_TMUX_COMPLETION_MARKER=$completion_marker Read and follow this review packet: $packet_token . Task: $owner_prompt . Write the complete response incrementally to ASK_TMUX_RESPONSE in bounded passes, preserve partial work, append ASK_TMUX_COMPLETION_MARKER only after full coverage, then print only ASK_TMUX_SENTINEL on its own final line."
   local delivery_status=0
   if send_prompt_to_pane "$pane" "$short_prompt" "$provider" "ASK_TMUX_RESPONSE_B64=$response_b64"; then
     delivery_status=0
@@ -1689,8 +1855,22 @@ cmd_send() {
   info "state=$state_file"
 
   if [[ "$wait" == "true" ]]; then
-    local done_rc
-    if wait_for_done "$session" "$pane" "$done_sentinel" "$response" "$wait_timeout" "$send_epoch" "$provider"; then
+    local done_rc=0
+    if wait_for_done_resilient "$session" "$pane" "$done_sentinel" "$response" "$wait_timeout" "$send_epoch" "$provider" "$completion_marker" "$stub" "$ready_timeout" "$auto_trust" "$response_token"; then
+      done_rc=0
+    else
+      done_rc="$?"
+    fi
+    if [[ "$done_rc" == "0" && "$provider" == "claude" && "$stub" != "true" ]]; then
+      if ensure_response_scope_complete "$session" "$pane" "$provider" "$response" "$response_token" "$completion_marker" "$packet" "$wait_timeout" "$send_epoch" "$stub" "$ready_timeout" "$auto_trust"; then
+        done_rc=0
+      else
+        done_rc="$?"
+      fi
+    fi
+
+    if [[ "$done_rc" == "0" ]]; then
+      strip_response_completion_marker "$response" "$completion_marker" || true
       write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "live" "$release_policy" "$ttl" "$response" "false" "$send_epoch" "$(date +%s)" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
       log_event "done" "$provider" "$session" "complete" "$response"
       info "done_sentinel=$done_sentinel"
@@ -1698,7 +1878,6 @@ cmd_send() {
       printf '%s\n' '--- response ---'
       sed -n '1,2000p' "$response"
     else
-      done_rc="$?"
       case "$done_rc" in
         1)
           write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$send_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
@@ -1721,8 +1900,8 @@ cmd_send() {
         4)
           write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$send_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
           log_event "provider_gateway_timeout_524" "$provider" "$session" "failed" "$response"
-          fail_outcome "provider_gateway_timeout_524" "false" \
-            "Claude provider gateway returned API Error 524 before completion. The gateway's 120-second origin timeout is shorter than this request's model latency; increasing --wait-timeout will not help. Split the task, request a concise response, lower Claude effort, or use a provider route with a longer streaming timeout."
+          fail_outcome "provider_gateway_timeout_524" "true" \
+            "Claude provider gateway returned API Error 524 and exhausted $CLAUDE_524_MAX_RETRIES resumable attempt(s). Partial response work was preserved at: $response. Increasing --wait-timeout does not change the upstream 120-second limit; retry this same key to resume, or use a provider route with a longer streaming timeout."
           ;;
         5)
           local completion_control_kind
@@ -1730,6 +1909,12 @@ cmd_send() {
           log_event "$completion_control_kind" "$provider" "$session" "failed" "during_completion control_kind=$TMUX_CONTROL_KIND exit=$TMUX_CONTROL_EXIT"
           fail_tmux_control "$completion_control_kind" "$TMUX_CONTROL_RETRYABLE" \
             "tmux control failed while waiting for consultant completion"
+          ;;
+        6)
+          write_state "$state_file" "$provider" "$key" "$project_slug" "$session" "$pane" "$resolved" "$packet" "failed" "$release_policy" "$ttl" "$response" "false" "$send_epoch" "" "$done_sentinel" "$requested_model" "$claude_launcher" "$requested_effort"
+          log_event "provider_scope_incomplete" "$provider" "$session" "failed" "$SCOPE_CHECK_LAST_FILE"
+          fail_outcome "provider_scope_incomplete" "true" \
+            "Claude exhausted $SCOPE_MAX_REVISIONS scope-completion revision(s). The response and last strict scope audit were preserved: response=$response audit=$SCOPE_CHECK_LAST_FILE"
           ;;
         *)
           die "unexpected wait failure: $done_rc"
@@ -2173,7 +2358,7 @@ cmd_doctor() {
 	    if command -v "$p" >/dev/null; then info "PASS ${p}_cli=$(command -v "$p")"; else info "FAIL ${p}_cli missing"; failed=1; fi
 	    if [[ "$p" == "claude" ]]; then
       if launcher="$(selected_claude_launcher)"; then
-        info "PASS ${p}_launch=${launcher} --dangerously-skip-permissions"
+        info "PASS ${p}_launch=${launcher} ${CLAUDE_RUNTIME_FLAGS}"
         if claude-provider-doctor --check-update >/dev/null 2>&1; then info "PASS ${p}_provider_doctor"; else info "FAIL ${p}_provider_doctor"; failed=1; fi
       else
         info "FAIL ${p}_launcher"; failed=1

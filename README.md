@@ -43,6 +43,17 @@ missing response, completion timeout, and gateway timeout. Pipeline state
 retains the typed outcome, retryability, and evidence artifact instead of
 collapsing every failure into a generic transport error.
 
+Claude consultants launch in `--bare` mode so owner plugins, hooks, MCP
+servers, memories, and auto-discovered instruction stacks cannot contaminate
+the independent review or inflate its bootstrap context. The explicit packet
+is the consultant contract.
+
+Claude responses are written incrementally with a durable file-completion
+marker. A strict second-pass scope audit maps every explicit owner deliverable
+to substantive response evidence; missing items trigger bounded revisions of
+the same response. The terminal pane sentinel alone is not accepted as proof
+of completion.
+
 The response protocol prefers a correlated, one-line
 `ask_tmux_pipeline.result.v2` JSON envelope. The legacy positional header
 format remains accepted during migration, and both formats must identify the
@@ -51,6 +62,10 @@ expected pipeline stage.
 The runner also handles non-interactive Homebrew paths, Bash 3 environments,
 reliable prompt submission, Codex update/workspace-trust prompts, and inherited
 state-lock descriptors.
+
+For the required Opus 5 invocation, 524 recovery procedure, scope-completion
+contract, and the evidence required before declaring an issue fixed, see
+[Claude Opus 5 Reliability Runbook](docs/claude-opus5-reliability-runbook.md).
 
 ## Install
 
@@ -149,15 +164,14 @@ be supplied with `--model claude-opus-5` (or directly to the launcher with
 provider-owned `max` effort. Pipelines persist the selected launcher, model,
 and effort across `answer` and `review` continuations.
 
-The runner treats Claude `API Error: 524`
-as a terminal provider failure instead of leaving the request busy until the
-local wait timeout. Raising `--wait-timeout` cannot extend a gateway's
-120-second origin-response limit. It records
-`provider_gateway_timeout_524` and does not automatically lower effort,
-switch providers, or retry the unchanged workload. Split the task or shorten
-the requested output; use a lower one-off `--effort` only when explicitly
-chosen. Detection uses the structured origin-timeout markers rather than
-Claude's decorative activity glyph, which can vary across TUI versions.
+The runner treats Claude `API Error: 524` as a retryable provider failure.
+Raising `--wait-timeout` cannot extend a gateway's 120-second origin-response
+limit. The runner preserves partial response work, waits the configured
+backoff, and resumes the same session and scope for a bounded number of
+attempts. It never silently lowers effort or switches models/providers. After
+exhaustion it records `provider_gateway_timeout_524`, reports
+`retryable=true`, and retains the partial artifact. Detection uses structured
+origin-timeout markers rather than Claude's decorative activity glyph.
 
 Send the same prompt to tmux Claude and synthesize the result in the owner CLI:
 

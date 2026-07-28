@@ -313,6 +313,77 @@ rm -f "$provider_timeout_fixture"
 [[ "$stale_provider_timeout_rc" == "2" ]] \
   || fail "a stale Claude gateway error should not fail a later request"
 
+completion_response_fixture="$(mktemp /tmp/ask-tmux-complete-response.XXXXXX)"
+printf '%s\n' 'Completed review body.' '<<<COMPLETE>>>' > "$completion_response_fixture"
+response_file_is_complete "$completion_response_fixture" '<<<COMPLETE>>>' 0 \
+  || fail "a fresh response with its terminal completion marker should be complete"
+strip_response_completion_marker "$completion_response_fixture" '<<<COMPLETE>>>' \
+  || fail "completion marker should be removable after verification"
+grep -Fqx 'Completed review body.' "$completion_response_fixture" \
+  || fail "stripping the completion marker must preserve response content"
+if grep -Fq '<<<COMPLETE>>>' "$completion_response_fixture"; then
+  fail "completion marker should not leak into the delivered response"
+fi
+rm -f "$completion_response_fixture"
+
+original_wait_for_done="$(declare -f wait_for_done)"
+original_wait_for_ready="$(declare -f wait_for_ready)"
+original_send_prompt_to_pane="$(declare -f send_prompt_to_pane)"
+original_log_event="$(declare -f log_event)"
+original_info="$(declare -f info)"
+original_sleep="$(declare -f sleep 2>/dev/null || true)"
+retry_response_fixture="$(mktemp /tmp/ask-tmux-retry-response.XXXXXX)"
+retry_prompt_fixture="$(mktemp /tmp/ask-tmux-retry-prompt.XXXXXX)"
+printf '%s\n' 'Preserved partial finding.' > "$retry_response_fixture"
+retry_wait_calls=0
+wait_for_done() {
+  retry_wait_calls="$((retry_wait_calls + 1))"
+  if [[ "$retry_wait_calls" == "1" ]]; then
+    return 4
+  fi
+  printf '%s\n' 'Completed resumed finding.' '<<<COMPLETE>>>' >> "$retry_response_fixture"
+  return 0
+}
+wait_for_ready() { return 0; }
+send_prompt_to_pane() {
+  printf '%s\n' "$2" > "$retry_prompt_fixture"
+  return 0
+}
+log_event() { :; }
+info() { :; }
+sleep() { :; }
+CLAUDE_524_MAX_RETRIES=2
+CLAUDE_524_BACKOFF_SECONDS=0
+wait_for_done_resilient fixture-session %fixture '<<<DONE>>>' \
+  "$retry_response_fixture" 0 0 claude '<<<COMPLETE>>>' false 0 false \
+  "$retry_response_fixture" \
+  || fail "a 524 should resume the same Claude session and complete"
+[[ "$retry_wait_calls" == "2" && "$WAIT_RECOVERY_RETRY_COUNT" == "1" ]] \
+  || fail "524 recovery should retry exactly the interrupted turn"
+grep -Fqx 'Preserved partial finding.' "$retry_response_fixture" \
+  || fail "524 recovery must preserve partial response work"
+grep -Fqx 'Completed resumed finding.' "$retry_response_fixture" \
+  || fail "524 recovery must retain resumed response work"
+grep -Fq 'Do not redo completed inspection or omit any requested scope.' "$retry_prompt_fixture" \
+  || fail "524 recovery prompt must preserve full scope"
+eval "$original_wait_for_done"
+eval "$original_wait_for_ready"
+eval "$original_send_prompt_to_pane"
+eval "$original_log_event"
+eval "$original_info"
+if [[ -n "$original_sleep" ]]; then eval "$original_sleep"; else unset -f sleep; fi
+rm -f "$retry_response_fixture" "$retry_prompt_fixture"
+
+scope_complete_fixture="$(mktemp /tmp/ask-tmux-scope-complete.XXXXXX)"
+scope_incomplete_fixture="$(mktemp /tmp/ask-tmux-scope-incomplete.XXXXXX)"
+printf '%s\n' 'ASK_TMUX_SCOPE_CHECK_V1' 'STATUS: COMPLETE' > "$scope_complete_fixture"
+printf '%s\n' 'ASK_TMUX_SCOPE_CHECK_V1' 'STATUS: INCOMPLETE' > "$scope_incomplete_fixture"
+[[ "$(scope_check_status "$scope_complete_fixture")" == "COMPLETE" ]] \
+  || fail "scope protocol should parse COMPLETE"
+[[ "$(scope_check_status "$scope_incomplete_fixture")" == "INCOMPLETE" ]] \
+  || fail "scope protocol should parse INCOMPLETE"
+rm -f "$scope_complete_fixture" "$scope_incomplete_fixture"
+
 [[ "$(codex_update_prompt_choice "$update_prompt_two")" == "2" ]] || fail "expected update prompt choice 2"
 [[ "$(codex_update_prompt_choice "$update_prompt_three")" == "3" ]] || fail "expected update prompt choice 3"
 if codex_update_prompt_choice "$update_prompt_no_skip" >/dev/null; then
@@ -479,11 +550,17 @@ claude_low_effort_launch_cmd="$(
   PATH="$gated_stub_dir:$PATH" provider_launch_command claude false claude-opus-5 low
 )"
 [[ "$claude_default_launch_cmd" == *"$gated_stub_dir/cc-claude"* &&
+   "$claude_default_launch_cmd" == *"--bare"* &&
+   "$claude_default_launch_cmd" == *"--disable-slash-commands"* &&
+   "$claude_default_launch_cmd" == *"--no-chrome"* &&
    "$claude_default_launch_cmd" == *"--dangerously-skip-permissions"* ]] \
-  || fail "Claude launch should default to the isolated cc-claude launcher"
+  || fail "Claude launch should use a bare isolated cc-claude runtime"
+[[ "$CLAUDE_RUNTIME_FLAGS" == "--bare --disable-slash-commands --no-chrome --dangerously-skip-permissions" ]] \
+  || fail "Claude runtime flags should have one diagnostic and execution source of truth"
 [[ "$claude_deepseek_launch_cmd" == *"$gated_stub_dir/cc-deepseek"* &&
+   "$claude_deepseek_launch_cmd" == *"--bare"* &&
    "$claude_deepseek_launch_cmd" == *"--dangerously-skip-permissions"* ]] \
-  || fail "DeepSeek launch should use the isolated cc-deepseek launcher"
+  || fail "DeepSeek launch should use a bare isolated cc-deepseek runtime"
 [[ "$claude_opus5_launch_cmd" == *"$gated_stub_dir/cc-claude"* &&
    "$claude_opus5_launch_cmd" == *"--model"* &&
    "$claude_opus5_launch_cmd" == *"claude-opus-5"* ]] \
@@ -503,6 +580,18 @@ claude_default_send_out="$(
 )"
 grep -Fq 'DRY_RUN claude_effort=high' <<<"$claude_default_send_out" \
   || fail "Claude send should default to high effort"
+
+packet_contract_fixture="$(mktemp /tmp/ask-tmux-packet-contract.XXXXXX)"
+write_packet "$packet_contract_fixture" claude review /tmp "Review fully." \
+  /tmp/response.md '<<<DONE>>>' '<<<COMPLETE>>>'
+grep -Fq 'bounded passes' "$packet_contract_fixture" \
+  || fail "Claude packet should require bounded incremental response writes"
+grep -Fq '<<<COMPLETE>>>' "$packet_contract_fixture" \
+  || fail "Claude packet should carry a durable response completion marker"
+if grep -Fq '### ``' "$packet_contract_fixture"; then
+  fail "an empty materials array must not create a phantom missing material"
+fi
+rm -f "$packet_contract_fixture"
 if (
   PATH="$gated_stub_dir:$PATH"
   ASK_TMUX_CLAUDE_LAUNCHER=cc-deepseek

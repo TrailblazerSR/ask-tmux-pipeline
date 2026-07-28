@@ -49,10 +49,11 @@ provider-owned `max` effort.
 
 If Claude reports `API Error: 524`, the provider gateway reached its
 120-second origin-response limit. Increasing `--wait-timeout` does not change
-that upstream limit. The runner should mark the request failed promptly.
-Retry once only after reducing the workload: split the review, request a more
-concise response, or select a lower `--effort`. Do not silently change models,
-providers, or reasoning quality.
+that upstream limit. The runner preserves incremental response work and resumes
+the same session and complete scope for a bounded number of attempts. It does
+not silently change models, providers, effort, or reasoning quality. If
+recovery is exhausted, report the retained partial artifact and
+`retryable=true`.
 
 ## Explicit Dual Review
 
@@ -154,7 +155,9 @@ Use `--cwd` on `capture`, `attach`, and `release` whenever a generic key such as
 
 - Use file-backed packets; do not paste giant specs directly into tmux.
 - Default to read-only review/comment/suggest behavior.
-- Treat the packet safety boundary as an instruction to the model, not an OS sandbox. The runner launches Claude with elevated local permissions, so only send trusted materials and do not grant write scope casually.
+- Claude consultants run in `--bare` mode so owner plugins, hooks, MCP servers,
+  memories, and auto-discovered instructions do not contaminate the review.
+- Treat the packet safety boundary as an instruction to the model, not an OS sandbox. The runner still uses elevated local permissions, so only send trusted materials and do not grant write scope casually.
 - The only default write allowed is the required response file named in the packet.
 - Do not grant persistent write permission unless the user explicitly authorizes the write scope.
 - Do not send secrets, credentials, cookies, or personal login material.
@@ -188,6 +191,18 @@ The consultant must write its response under:
 ```text
 <cwd>/.ask-tmux/consultants/responses/
 ```
+
+For live Claude runs, completion requires both a durable file marker and a
+strict scope-audit artifact that maps every explicit owner deliverable to
+substantive response content. A pane sentinel or a model's unsupported
+"complete" claim is insufficient.
+
+Never claim a transport defect is fixed from detection-only, stub-only, or
+grep-only evidence. Require a deterministic regression, the complete local
+test cohort, a live non-private Opus 5/high probe, a synthetic full-scope
+acceptance run, installed/source parity, and installed doctor/preflight checks.
+The repository procedure is
+`docs/claude-opus5-reliability-runbook.md`.
 
 State lives under:
 
