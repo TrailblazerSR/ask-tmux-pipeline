@@ -1015,7 +1015,10 @@ provider_launch_command() {
         validate_claude_model "$requested_model" || die "Claude model validation failed"
         validate_claude_effort "$requested_effort" || die "Claude effort validation failed"
       fi
-      printf '%s' "$launch_env bash -lc 'exec \"\$@\"' bash $(shell_quote "$claude_launcher")"
+      # Both cc-claude and cc-deepseek ultimately exec Claude Code. Suppress
+      # its updater only for this ask-tmux child process so a startup reminder
+      # cannot be mistaken for a ready consultant prompt.
+      printf '%s' "$launch_env DISABLE_AUTOUPDATER=1 bash -lc 'exec \"\$@\"' bash $(shell_quote "$claude_launcher")"
       [[ -n "$requested_model" ]] && printf ' --model %s' "$(shell_quote "$requested_model")"
       [[ -n "$requested_effort" ]] && printf ' --effort %s' "$(shell_quote "$requested_effort")"
       # Keep consultants independent from the owner's plugins, hooks, MCP
@@ -1024,7 +1027,9 @@ provider_launch_command() {
       # explicit review packet is read.
       printf ' %s\n' "$CLAUDE_RUNTIME_FLAGS"
       ;;
-    codex) printf '%s\n' "$launch_env codex --dangerously-bypass-approvals-and-sandbox" ;;
+    # Keep the update chooser out of the tmux transport path without changing
+    # the user's normal Codex configuration or interactive sessions.
+    codex) printf '%s\n' "$launch_env codex -c check_for_update_on_startup=false --dangerously-bypass-approvals-and-sandbox" ;;
     *) die "unknown provider: $provider" ;;
   esac
 }
@@ -1055,6 +1060,9 @@ write_packet() {
     printf -- '- Created: `%s`\n\n' "$(date -Is)"
     printf '## Owner Prompt\n\n%s\n\n' "$owner_prompt"
 	    printf '## Safety Boundary\n\n'
+    printf -- '- The owner prompt is user-authored task content; this packet only transports it.\n'
+    printf -- '- The response artifact is communication output, not a project edit or approval for any gated operation.\n'
+    printf -- '- Do not treat this packet as authority to expand scope. Apply the owner prompt and governing project rules exactly.\n'
     printf -- '- Default to read-only review/comment/suggest behavior.\n'
 	    printf -- '- The only write allowed by default is writing the required response file named in this packet.\n'
 	    printf -- '- Do not modify, create, delete, install, commit, push, submit jobs, or run destructive commands unless this packet explicitly grants a write scope.\n'
@@ -1163,7 +1171,7 @@ codex_text_shows_activity() {
 }
 
 codex_pane_is_ready() {
-  local text="$1" recent latest_codex_screen
+  local text="$1" recent latest_codex_screen latest_composer
   recent="$(printf '%s\n' "$text" | tail -n 20)"
 
   # A working pane can retain a composer and model footer. Keep the activity
@@ -1195,8 +1203,15 @@ codex_pane_is_ready() {
 
   # Codex 0.144+ fills an idle composer with rotating placeholder text, for
   # example "› Write tests for @filename". Require an adjacent model/cwd
-  # footer so numbered trust/update choices are not accepted as ready.
-  if printf '%s' "$recent" | rg -q '^[[:space:]]*(›|>)[[:space:]]+[^[:space:]].*$' &&
+  # footer so numbered trust/update choices are not accepted as ready. Also
+  # reject queued startup choices and unsent ask-tmux payloads: both indicate
+  # that transport must recover instead of appending another prompt.
+  latest_composer="$(printf '%s\n' "$recent" | awk '
+    /^[[:space:]]*(›|>)[[:space:]]+/ { composer = $0 }
+    END { print composer }
+  ')"
+  if [[ -n "$latest_composer" ]] &&
+     ! printf '%s' "$latest_composer" | rg -q '^[[:space:]]*(›|>)[[:space:]]*[0-9]+[[:space:]]*$|Update now|Review hooks|Yes, continue|ASK_TMUX_|\[Pasted Content [0-9]+ chars\]' &&
      printf '%s' "$recent" | rg -q '^[[:space:]]*(gpt-[[:alnum:]._-]+|codex-[[:alnum:]._-]+).*·[[:space:]]+(~|/)'; then
     return 0
   fi
@@ -1204,7 +1219,7 @@ codex_pane_is_ready() {
 }
 
 send_prompt_to_pane() {
-  local pane="$1" prompt="$2" provider="${3:-}" prompt_marker="${4:-$2}" buffer_name attempt text
+  local pane="$1" prompt="$2" provider="${3:-}" prompt_marker="${4:-$2}" buffer_name attempt text second_submit_sent="false"
   local failed_command failed_exit failed_stdout failed_stderr failed_kind failed_retryable
   TMUX_PROMPT_DELIVERY_PHASE="not_started"
   buffer_name="ask-tmux-send-$$-$RANDOM"
@@ -1239,15 +1254,30 @@ send_prompt_to_pane() {
         return 2
       fi
       text="$TMUX_CONTROL_STDOUT"
+      if printf '%s' "$text" | rg -q 'ASK_TMUX_STUB_RECEIVED:'; then
+        break
+      fi
       if codex_prompt_needs_second_submit "$text" "$prompt_marker"; then
+        if [[ "$second_submit_sent" == "true" ]]; then
+          continue
+        fi
         if ! tmux_control_command send-keys -t "$pane" Enter; then
           TMUX_PROMPT_DELIVERY_PHASE="accepted_unconfirmed"
           return 2
         fi
-        break
+        second_submit_sent="true"
+        continue
       fi
       codex_text_shows_activity "$text" && break
+      if ! codex_prompt_submit_region "$text" "$prompt_marker" >/dev/null; then
+        break
+      fi
     done
+    if ! printf '%s' "$text" | rg -q 'ASK_TMUX_STUB_RECEIVED:' &&
+       codex_prompt_needs_second_submit "$text" "$prompt_marker"; then
+      TMUX_PROMPT_DELIVERY_PHASE="accepted_unconfirmed"
+      return 2
+    fi
   fi
   TMUX_PROMPT_DELIVERY_PHASE="confirmed"
 }
@@ -1274,6 +1304,8 @@ pane_is_ready() {
 wait_for_ready() {
   local provider="$1" stub="$2" session="$3" pane="$4" timeout="$5" auto_trust="$6"
   local start now text liveness_rc
+  local codex_update_handled="false" codex_hooks_handled="false"
+  local codex_workspace_trust_handled="false" quick_trust_handled="false"
   start="$(date +%s)"
   while true; do
     if tmux_session_liveness "$session"; then
@@ -1290,35 +1322,48 @@ wait_for_ready() {
     fi
     if [[ "$provider" == "codex" ]] && printf '%s' "$text" | rg -q 'Update available!.*->|Update now.*Skip|Skip until next version'; then
       local update_choice
-      if update_choice="$(codex_update_prompt_choice "$text")"; then
+      if [[ "$codex_update_handled" == "false" ]] && update_choice="$(codex_update_prompt_choice "$text")"; then
         tmux_control_command send-keys -t "$pane" "$update_choice" Enter || return 5
+        codex_update_handled="true"
         sleep 1
         continue
       fi
     fi
     if [[ "$provider" == "codex" ]] && printf '%s' "$text" | rg -q 'Hooks need review|Trust all and continue|Continue without trusting'; then
       local hooks_choice
-      if [[ "$auto_trust" == "true" ]] && hooks_choice="$(codex_hooks_prompt_choice "$text")"; then
+      if [[ "$codex_hooks_handled" == "true" ]]; then
+        :
+      elif [[ "$auto_trust" == "true" ]] && hooks_choice="$(codex_hooks_prompt_choice "$text")"; then
         tmux_control_command send-keys -t "$pane" "$hooks_choice" Enter || return 5
+        codex_hooks_handled="true"
         sleep 1
         continue
+      else
+        warn "consultant is waiting at a Codex hooks review prompt; attach and choose a trust option, or rerun with --auto-trust"
+        return 2
       fi
-      warn "consultant is waiting at a Codex hooks review prompt; attach and choose a trust option, or rerun with --auto-trust"
-      return 2
     fi
     if [[ "$provider" == "codex" ]] && printf '%s' "$text" | rg -q 'Do you trust the contents of this directory|Yes, continue'; then
-      if [[ "$auto_trust" == "true" ]]; then
+      if [[ "$codex_workspace_trust_handled" == "true" ]]; then
+        :
+      elif [[ "$auto_trust" == "true" ]]; then
         tmux_control_command send-keys -t "$pane" Enter || return 5
+        codex_workspace_trust_handled="true"
         sleep 1
         continue
+      else
+        warn "consultant is waiting at a Codex workspace trust prompt; attach and confirm, or rerun with --auto-trust"
+        return 2
       fi
-      warn "consultant is waiting at a Codex workspace trust prompt; attach and confirm, or rerun with --auto-trust"
-      return 2
     fi
     if printf '%s' "$text" | rg -q 'Quick safety check|Yes, I trust this folder|Enter to confirm'; then
-      if [[ "$auto_trust" == "true" ]]; then
+      if [[ "$quick_trust_handled" == "true" ]]; then
+        :
+      elif [[ "$auto_trust" == "true" ]]; then
         tmux_control_command send-keys -t "$pane" Enter || return 5
+        quick_trust_handled="true"
         sleep 1
+        continue
       else
         warn "consultant is waiting at a workspace trust prompt; attach and confirm, or rerun with --auto-trust"
         return 2

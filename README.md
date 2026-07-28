@@ -164,6 +164,12 @@ be supplied with `--model claude-opus-5` (or directly to the launcher with
 provider-owned `max` effort. Pipelines persist the selected launcher, model,
 and effort across `answer` and `review` continuations.
 
+To keep startup UI out of the tmux transport, ask-tmux suppresses update
+checks only in the child process it launches: Claude-family lanes use
+`DISABLE_AUTOUPDATER=1`, while Codex uses
+`check_for_update_on_startup=false`. Normal interactive provider sessions and
+manual update commands are unchanged.
+
 The runner treats Claude `API Error: 524` as a retryable provider failure.
 Raising `--wait-timeout` cannot extend a gateway's 120-second origin-response
 limit. The runner preserves partial response work, waits the configured

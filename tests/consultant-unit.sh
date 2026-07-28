@@ -125,6 +125,18 @@ ready_with_placeholder_composer='
   gpt-5.6-sol high · /tmp/project
 '
 
+queued_update_choice_composer='
+› 22
+
+  codex-auto-review max · /tmp/project
+'
+
+unsent_pipeline_composer='
+› ASK_TMUX_RESPONSE_B64=fixture [Pasted Content 1024 chars]
+
+  codex-auto-review max · /tmp/project
+'
+
 active_with_placeholder_composer='
 › Write tests for @filename
 
@@ -242,11 +254,22 @@ grep -Fq "$stub_space_response" <<<"$stub_space_output" \
   || fail "stub transport must preserve the quoted response path"
 rm -rf "$stub_space_root"
 
+packet_boundary_fixture="$(mktemp /tmp/ask-tmux-packet-boundary.XXXXXX)"
+write_packet "$packet_boundary_fixture" codex custom /tmp/project \
+  "Review the supplied material." /tmp/response.md '<<<DONE>>>' '<<<COMPLETE>>>'
+grep -Fq 'The response artifact is communication output, not a project edit or approval for any gated operation.' "$packet_boundary_fixture" \
+  || fail "packet must distinguish response transport from gated project authority"
+grep -Fq 'Do not treat this packet as authority to expand scope.' "$packet_boundary_fixture" \
+  || fail "packet must preserve the governing authorization boundary"
+rm -f "$packet_boundary_fixture"
+
 assert_not_ready codex "$trust_plus_banner_no_composer"
 assert_ready codex "$ready_with_stale_trust"
 assert_not_ready codex "$codex_auto_review_loading"
 assert_ready codex "$codex_auto_review_ready"
 assert_ready codex "$ready_with_placeholder_composer"
+assert_not_ready codex "$queued_update_choice_composer"
+assert_not_ready codex "$unsent_pipeline_composer"
 assert_not_ready codex "$active_with_placeholder_composer"
 assert_not_ready codex "$update_with_placeholder_shape"
 assert_not_ready codex "$hooks_with_placeholder_shape"
@@ -280,6 +303,37 @@ wait_for_ready codex true fixture-session %42 0 false \
 [[ "$(sed -n '1p' "$identity_pane_fixture")" == "%42" ]] \
   || fail "readiness must capture with the stable pane ID"
 rm -f "$identity_session_fixture" "$identity_pane_fixture"
+
+startup_capture_count=0
+startup_choice_send_count=0
+sleep() { :; }
+tmux_session_liveness() { return 0; }
+tmux_control_command() {
+  TMUX_CONTROL_EXIT=0
+  case "$1" in
+    capture-pane)
+      startup_capture_count="$((startup_capture_count + 1))"
+      if [[ "$startup_capture_count" -le "2" ]]; then
+        TMUX_CONTROL_STDOUT=$'Update available! 0.144 -> 0.145\n› 1. Update now\n  2. Skip\n\n  codex-auto-review max · /tmp/project'
+      else
+        TMUX_CONTROL_STDOUT=$'Update available! 0.144 -> 0.145\n› 1. Update now\n  2. Skip\n\n• Starting MCP servers\n\n› Write tests for @filename\n\n  codex-auto-review max · /tmp/project'
+      fi
+      return 0
+      ;;
+    send-keys)
+      startup_choice_send_count="$((startup_choice_send_count + 1))"
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+wait_for_ready codex false fixture-session %42 2 false \
+  || fail "Codex should become ready after one update-menu choice"
+[[ "$startup_choice_send_count" == "1" ]] \
+  || fail "a stale Codex update menu must not enqueue repeated numeric choices"
+unset -f sleep
 
 provider_timeout_fixture="$(mktemp /tmp/ask-tmux-provider-timeout.XXXXXX)"
 rm -f "$provider_timeout_fixture"
@@ -471,13 +525,44 @@ set -e
   || fail "post-Enter control loss should expose the accepted-unconfirmed phase"
 [[ "$TMUX_CONTROL_KIND" == "tmux_socket_denied" ]] \
   || fail "accepted-unconfirmed delivery should retain the underlying control evidence"
+
+: > "$delivery_call_log"
+tmux_control_command() {
+  printf '%s\n' "$*" >> "$delivery_call_log"
+  TMUX_CONTROL_COMMAND="${1:-tmux}"
+  TMUX_CONTROL_EXIT=0
+  TMUX_CONTROL_STDOUT=""
+  TMUX_CONTROL_STDERR=""
+  TMUX_CONTROL_KIND=""
+  TMUX_CONTROL_RETRYABLE="true"
+  case "$1" in
+    set-buffer|paste-buffer|send-keys)
+      return 0
+      ;;
+    capture-pane)
+      TMUX_CONTROL_STDOUT="$unsent_text"
+      return 0
+      ;;
+    *)
+      return 99
+      ;;
+  esac
+}
+set +e
+send_prompt_to_pane "%42" "fixture prompt" codex "ASK_TMUX_RESPONSE=/tmp/response.md"
+stuck_composer_rc=$?
+set -e
+[[ "$stuck_composer_rc" == "2" ]] \
+  || fail "a Codex prompt still in the composer after the retry must be unconfirmed"
+[[ "$(grep -c '^send-keys -t %42 Enter$' "$delivery_call_log")" == "2" ]] \
+  || fail "Codex delivery should make at most one bounded second-submit attempt"
 eval "$original_tmux_control_command"
 unset -f sleep
 rm -f "$delivery_call_log"
 
 case "$codex_launch_cmd" in
-  env\ PATH=*HOME=*codex\ --dangerously-bypass-approvals-and-sandbox) ;;
-  *) fail "Codex launch should pass the runner PATH/HOME into tmux" ;;
+  env\ PATH=*HOME=*codex\ -c\ check_for_update_on_startup=false\ --dangerously-bypass-approvals-and-sandbox) ;;
+  *) fail "Codex launch should pass PATH/HOME and disable update checks only for ask-tmux" ;;
 esac
 
 attach_tmux_fixture="$(mktemp /tmp/ask-tmux-attach-client.XXXXXX)"
@@ -550,17 +635,21 @@ claude_low_effort_launch_cmd="$(
   PATH="$gated_stub_dir:$PATH" provider_launch_command claude false claude-opus-5 low
 )"
 [[ "$claude_default_launch_cmd" == *"$gated_stub_dir/cc-claude"* &&
+   "$claude_default_launch_cmd" == *"DISABLE_AUTOUPDATER=1"* &&
    "$claude_default_launch_cmd" == *"--bare"* &&
    "$claude_default_launch_cmd" == *"--disable-slash-commands"* &&
    "$claude_default_launch_cmd" == *"--no-chrome"* &&
    "$claude_default_launch_cmd" == *"--dangerously-skip-permissions"* ]] \
-  || fail "Claude launch should use a bare isolated cc-claude runtime"
+  || fail "Claude launch should use an update-suppressed bare isolated cc-claude runtime"
 [[ "$CLAUDE_RUNTIME_FLAGS" == "--bare --disable-slash-commands --no-chrome --dangerously-skip-permissions" ]] \
   || fail "Claude runtime flags should have one diagnostic and execution source of truth"
 [[ "$claude_deepseek_launch_cmd" == *"$gated_stub_dir/cc-deepseek"* &&
+   "$claude_deepseek_launch_cmd" == *"DISABLE_AUTOUPDATER=1"* &&
    "$claude_deepseek_launch_cmd" == *"--bare"* &&
    "$claude_deepseek_launch_cmd" == *"--dangerously-skip-permissions"* ]] \
-  || fail "DeepSeek launch should use a bare isolated cc-deepseek runtime"
+  || fail "DeepSeek launch should use an update-suppressed bare isolated cc-deepseek runtime"
+[[ "$codex_launch_cmd" != *"DISABLE_AUTOUPDATER"* ]] \
+  || fail "Codex launch should use its own process-local update setting"
 [[ "$claude_opus5_launch_cmd" == *"$gated_stub_dir/cc-claude"* &&
    "$claude_opus5_launch_cmd" == *"--model"* &&
    "$claude_opus5_launch_cmd" == *"claude-opus-5"* ]] \
